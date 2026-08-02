@@ -4629,6 +4629,17 @@ internal static unsafe class VulkanVideoPresenter
             CreateOverlayResources();
         }
 
+        /// <summary>
+        /// The pixel format <see cref="PerfOverlay"/> writes its panel in.
+        /// </summary>
+        /// <remarks>
+        /// Named rather than repeated as a literal because the transfer of that panel onto the
+        /// presentation target has to know whether the two agree: they do on every desktop surface
+        /// and never on an Android one, and the difference decides between a raw copy and a
+        /// converting blit.
+        /// </remarks>
+        private const Format OverlayFormat = Format.B8G8R8A8Unorm;
+
         private void CreateOverlayResources()
         {
             const ulong overlayBytes = PerfOverlay.PanelWidth * PerfOverlay.PanelHeight * 4;
@@ -4636,7 +4647,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageCreateInfo,
                 ImageType = ImageType.Type2D,
-                Format = Format.B8G8R8A8Unorm,
+                Format = OverlayFormat,
                 Extent = new Extent3D(PerfOverlay.PanelWidth, PerfOverlay.PanelHeight, 1),
                 MipLevels = 1,
                 ArrayLayers = 1,
@@ -4768,28 +4779,74 @@ internal static unsafe class VulkanVideoPresenter
             const int margin = 12;
             var panelWidth = (int)Math.Min(PerfOverlay.PanelWidth, _extent.Width - margin);
             var panelHeight = (int)Math.Min(PerfOverlay.PanelHeight, _extent.Height - margin);
-            // Source and destination are both B8G8R8A8 and the panel is not
-            // scaled. MoltenVK has corrupted pixels outside the blit region
-            // for this transfer-on-swapchain path (horizontal red/yellow
-            // scanlines across the entire window). An exact image copy has
-            // the required semantics and avoids the driver's blit conversion
-            // path altogether.
-            var copy = new ImageCopy
+            if (PresentationTargetFormat == OverlayFormat)
             {
-                SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                SrcOffset = new Offset3D(0, 0, 0),
-                DstOffset = new Offset3D(margin, margin, 0),
-                Extent = new Extent3D((uint)panelWidth, (uint)panelHeight, 1),
-            };
-            _vk.CmdCopyImage(
-                _commandBuffer,
-                _overlayImage,
-                ImageLayout.TransferSrcOptimal,
-                presentationTarget,
-                ImageLayout.TransferDstOptimal,
-                1,
-                &copy);
+                // Source and destination are both B8G8R8A8 and the panel is not
+                // scaled. MoltenVK has corrupted pixels outside the blit region
+                // for this transfer-on-swapchain path (horizontal red/yellow
+                // scanlines across the entire window). An exact image copy has
+                // the required semantics and avoids the driver's blit conversion
+                // path altogether.
+                var copy = new ImageCopy
+                {
+                    SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    SrcOffset = new Offset3D(0, 0, 0),
+                    DstOffset = new Offset3D(margin, margin, 0),
+                    Extent = new Extent3D((uint)panelWidth, (uint)panelHeight, 1),
+                };
+                _vk.CmdCopyImage(
+                    _commandBuffer,
+                    _overlayImage,
+                    ImageLayout.TransferSrcOptimal,
+                    presentationTarget,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copy);
+            }
+            else
+            {
+                // The presentation target is not B8G8R8A8, so the copy above would
+                // reinterpret the overlay's bytes rather than convert them and the
+                // panel would render with its red and blue channels exchanged.
+                // vkCmdCopyImage is a raw byte transfer; vkCmdBlitImage matches
+                // components by name, which is exactly the channel reorder needed.
+                //
+                // This is reachable wherever the surface exposes no B8G8R8A8 format
+                // at all, which no desktop does and Android always does: an Android
+                // swapchain offers R8G8B8A8 UNORM and SRGB and nothing else, so
+                // ChooseSurfaceFormat falls through to formats[0] and lands on
+                // R8G8B8A8Unorm. The copy path above is left untouched for every
+                // host that does have a matching format, MoltenVK included.
+                var sourceOffsets = new ImageBlit.SrcOffsetsBuffer
+                {
+                    Element0 = new Offset3D(0, 0, 0),
+                    Element1 = new Offset3D(panelWidth, panelHeight, 1),
+                };
+                var destinationOffsets = new ImageBlit.DstOffsetsBuffer
+                {
+                    Element0 = new Offset3D(margin, margin, 0),
+                    Element1 = new Offset3D(margin + panelWidth, margin + panelHeight, 1),
+                };
+                var blit = new ImageBlit
+                {
+                    SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    SrcOffsets = sourceOffsets,
+                    DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    DstOffsets = destinationOffsets,
+                };
+                // Nearest, because the regions are the same size: this blit exists
+                // to convert, never to scale.
+                _vk.CmdBlitImage(
+                    _commandBuffer,
+                    _overlayImage,
+                    ImageLayout.TransferSrcOptimal,
+                    presentationTarget,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &blit,
+                    Filter.Nearest);
+            }
 
             var presentationTargetToFinal = new ImageMemoryBarrier
             {
