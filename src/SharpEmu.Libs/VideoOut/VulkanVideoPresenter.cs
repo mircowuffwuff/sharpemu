@@ -4138,7 +4138,17 @@ internal static unsafe class VulkanVideoPresenter
                 PNext = &robustness2Features,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
-            var supportsMaintenance8 = maintenance8Features.Maintenance8;
+            // A feature bit is not permission to enable the extension that defines it. The spec
+            // requires an extension to be advertised by vkEnumerateDeviceExtensionProperties
+            // before it may appear in ppEnabledExtensionNames, and a driver is free to report a
+            // feature it implements without advertising the extension - Mesa's Turnip does exactly
+            // that for maintenance8. Enabling it anyway fails the whole vkCreateDevice call with
+            // ErrorExtensionNotPresent, which takes the presenter with it.
+            //
+            // Any device that does advertise the extension is unaffected: the check below returns
+            // true and this is the value it always was.
+            var supportsMaintenance8 =
+                maintenance8Features.Maintenance8 && IsDeviceExtensionAvailable("VK_KHR_maintenance8");
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
