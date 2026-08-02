@@ -8,6 +8,7 @@ using SharpEmu.Core.Cpu.Native;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu;
 
@@ -22,19 +23,21 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
     // The top of the x86-64 user address space (0x7FFD..0x7FFF) is only
     // freely mappable on Windows; on macOS/Linux it hosts the dyld shared
     // cache / vdso and (under Rosetta 2) the translator runtime, so POSIX
-    // hosts use the equivalent layout one slot lower at 0x6FFx.
-    private static readonly ulong StackBaseAddress = OperatingSystem.IsWindows() ? 0x7FFF_F000_0000UL : 0x6FFF_F000_0000UL;
+    // hosts use the equivalent layout one slot lower at 0x6FFx. Neither fits
+    // a host whose user address space is narrower than 47 bits, so the whole
+    // family is chosen once at startup - see HostAddressSpace.
+    private static readonly ulong StackBaseAddress = HostAddressSpace.StackBaseAddress;
     private const ulong StackSize = 0x0020_0000UL;
-    private static readonly ulong TlsBaseAddress = OperatingSystem.IsWindows() ? 0x7FFE_0000_0000UL : 0x6FFE_0000_0000UL;
+    private static readonly ulong TlsBaseAddress = HostAddressSpace.TlsBaseAddress;
     private const ulong TlsSize = 0x0001_0000UL;
     // The static TLS blocks live at negative offsets from the TCB (FreeBSD
     // amd64 variant II). Keep every host in sync with GuestTlsTemplate's
     // startup reservation; PS5 modules routinely reach beyond one host page.
     private const ulong TlsPrefixSize = GuestTlsTemplate.StartupStaticTlsReservation;
-    private static readonly ulong BootstrapStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_F000_0000UL : 0x6FFD_F000_0000UL;
-    private static readonly ulong BootstrapPayloadBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_E000_0000UL : 0x6FFD_E000_0000UL;
-    private static readonly ulong DynlibFallbackStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_D000_0000UL : 0x6FFD_D000_0000UL;
-    private static readonly ulong ReturnToHostStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_C000_0000UL : 0x6FFD_C000_0000UL;
+    private static readonly ulong BootstrapStubBaseAddress = HostAddressSpace.BootstrapStubBaseAddress;
+    private static readonly ulong BootstrapPayloadBaseAddress = HostAddressSpace.BootstrapPayloadBaseAddress;
+    private static readonly ulong DynlibFallbackStubBaseAddress = HostAddressSpace.DynlibFallbackStubBaseAddress;
+    private static readonly ulong ReturnToHostStubBaseAddress = HostAddressSpace.ReturnToHostStubBaseAddress;
     private const ulong BootstrapRegionSize = 0x0000_1000UL;
     private const ulong ReturnToHostStubStride = 0x0100_0000UL;
     private const ulong BootstrapPayloadResultOffset = 0x28UL;

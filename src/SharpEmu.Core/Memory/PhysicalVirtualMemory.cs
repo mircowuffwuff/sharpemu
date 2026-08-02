@@ -26,7 +26,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private long _mappingGeneration;
     private const ulong PageSize = 0x1000;
-    private const ulong GuestAllocationArenaAddress = 0x00006000_0000_0000;
+    private static readonly ulong GuestAllocationArenaAddress = HostAddressSpace.GuestAllocationArenaAddress;
     private const ulong GuestAllocationArenaSize = 0x0100_0000;
     private const ulong GuestAllocationArenaStartOffset = PageSize;
     private const ulong LargeDataReserveThreshold = 0x4000_0000UL; // 1 GiB

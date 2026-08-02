@@ -11,6 +11,7 @@ using SharpEmu.Core;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Loader;
 
@@ -21,7 +22,7 @@ public sealed class SelfLoader : ISelfLoader
     private const uint Ps5SelfMagic = 0x5414F5EE;
     private const ulong SelfSegmentFlag = 0x800;
     private const int PageSize = 0x1000;
-    private const ulong ImportStubBaseAddress = 0x0000_7000_0000_0000UL;
+    private static readonly ulong ImportStubBaseAddress = HostAddressSpace.ImportStubBaseAddress;
     private const ulong ImportStubAddressStride = 0x0000_0000_0100_0000UL;
     private const ulong ImportStubSlotSize = 0x10;
     private const byte StubTrapOpcode = 0xCC;
@@ -1770,7 +1771,9 @@ public sealed class SelfLoader : ISelfLoader
             }
         }
 
-        throw new InvalidOperationException("Unable to reserve an import stub region in virtual memory.");
+        throw new InvalidOperationException(
+            "Unable to reserve an import stub region in virtual memory. " +
+            HostAddressSpace.Describe());
     }
 
     private static bool IsAddressRangeMapped(IVirtualMemory virtualMemory, ulong start, ulong size)

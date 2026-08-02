@@ -13,6 +13,7 @@ using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Diagnostics;
 
 namespace SharpEmu.Core.Cpu.Native;
@@ -149,10 +150,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private const ulong GuestImageScanEnd = 36507222016uL;
 
 	// See CpuDispatcher: the 0x7FFx window is Windows-only; POSIX hosts
-	// (dyld shared cache, Rosetta 2 runtime) use 0x6FFx instead.
-	private static readonly ulong GuestThreadStackBaseAddress = OperatingSystem.IsWindows() ? 0x7FFF_E000_0000UL : 0x6FFF_E000_0000UL;
+	// (dyld shared cache, Rosetta 2 runtime) use 0x6FFx instead, and a host
+	// with a narrower user address space than 47 bits gets neither. The whole
+	// family is chosen once at startup - see HostAddressSpace.
+	private static readonly ulong GuestThreadStackBaseAddress = HostAddressSpace.GuestThreadStackBaseAddress;
 
-	private static readonly ulong GuestThreadTlsBaseAddress = OperatingSystem.IsWindows() ? 0x7FFE_0000_0000UL : 0x6FFE_0000_0000UL;
+	private static readonly ulong GuestThreadTlsBaseAddress = HostAddressSpace.GuestThreadTlsBaseAddress;
 
 	private const ulong GuestThreadStackSize = 0x0020_0000UL;
 

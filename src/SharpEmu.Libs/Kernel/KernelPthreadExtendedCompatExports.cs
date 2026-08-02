@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
@@ -575,9 +576,13 @@ public static class KernelPthreadExtendedCompatExports
 			return false;
 		}
 
-		var highestStack = OperatingSystem.IsWindows()
-			? 0x00007FFF_F000_0000UL
-			: 0x00006FFF_F000_0000UL;
+		// The main guest stack anchor, which is where this window has always been
+		// measured from: 16 slots above the base DirectExecutionBackend hands
+		// native guest thread stacks out from, so the 63 strides below reach the
+		// first 32 of them. Wherever HostAddressSpace put it - 0x7FFF_F000_0000 on
+		// Windows, 0x6FFF_F000_0000 on a 47-bit POSIX host, lower on a host with
+		// less address space than that.
+		var highestStack = HostAddressSpace.StackBaseAddress;
 		var lowestStack = highestStack - (63 * NativeGuestStackStride);
 		if (candidate < lowestStack || candidate > highestStack)
 		{
