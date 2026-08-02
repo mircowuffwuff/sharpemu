@@ -2958,7 +2958,7 @@ internal static unsafe class VulkanVideoPresenter
         private const string FullscreenBarycentricFragmentSpirv =
             "AwIjBwAAAQALAAgAEgAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ABwAEAAAABAAAAG1haW4AAAAACQAAAAwAAAAQAAMABAAAAAcAAAADAAMAAgAAAMIBAAAFAAQABAAAAG1haW4AAAAABQAFAAkAAABvdXRDb2xvcgAAAAAFAAUADAAAAGJhcnljZW50cmljAEcABAAJAAAAHgAAAAAAAABHAAQADAAAAB4AAAAAAAAAEwACAAIAAAAhAAMAAwAAAAIAAAAWAAMABgAAACAAAAAXAAQABwAAAAYAAAAEAAAAIAAEAAgAAAADAAAABwAAADsABAAIAAAACQAAAAMAAAAXAAQACgAAAAYAAAACAAAAIAAEAAsAAAABAAAACgAAADsABAALAAAADAAAAAEAAAArAAQABgAAAA4AAAAAAAAANgAFAAIAAAAEAAAAAAAAAAMAAAD4AAIABQAAAD0ABAAKAAAADQAAAAwAAABRAAUABgAAAA8AAAANAAAAAAAAAFEABQAGAAAAEAAAAA0AAAABAAAAUAAHAAcAAAARAAAADwAAABAAAAAOAAAADgAAAD4AAwAJAAAAEQAAAP0AAQA4AAEA";
 
-        private readonly SdlHostWindow _window;
+        private readonly IHostWindow _window;
         private const int MaxInFlightGuestSubmissions = 8;
         private Vk _vk = null!;
         private KhrSurface _surfaceApi = null!;
@@ -3444,10 +3444,15 @@ internal static unsafe class VulkanVideoPresenter
             _hostBufferPool = new VulkanHostBufferPool(
                 MaximumCachedHostBufferBytes,
                 DestroyHostBufferAllocation);
-            _window = new SdlHostWindow(
-                VideoOutExports.GetWindowTitle(),
-                _videoOptions,
-                SdlGraphicsApi.Vulkan);
+            // SDL everywhere it has a video driver to open, which is everywhere but Android.
+            _window = AndroidHostWindow.IsSelected()
+                ? new AndroidHostWindow(
+                    VideoOutExports.GetWindowTitle(),
+                    _videoOptions)
+                : new SdlHostWindow(
+                    VideoOutExports.GetWindowTitle(),
+                    _videoOptions,
+                    SdlGraphicsApi.Vulkan);
         }
 
         public void Run()

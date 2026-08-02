@@ -22,7 +22,7 @@ internal readonly record struct SdlHdrState(
     float SdrWhiteLevel,
     float Headroom);
 
-internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
+internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput, IHostWindow
 {
     private const SDL_InitFlags InitFlags = SDL_InitFlags.SDL_INIT_VIDEO | SDL_InitFlags.SDL_INIT_GAMEPAD;
     private static readonly long CursorHideDelayTicks = 2 * Stopwatch.Frequency;
