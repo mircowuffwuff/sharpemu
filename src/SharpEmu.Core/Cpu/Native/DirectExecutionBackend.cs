@@ -299,6 +299,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private nint _guestContextTransferStub;
 
+	// A blocked guest thread is resumed through a stub that loads its register file
+	// and returns to its continuation. That stub used to be written fresh into an
+	// mmap'd page and released again on every resume, with the target address and all
+	// sixteen registers baked in as immediates -- which is free on a CPU with a
+	// coherent instruction cache and is not free under a recompiler, because the
+	// allocator hands the same address back and the same address then holds different
+	// code on consecutive resumes.
+	//
+	// It is one permanent stub now, driven by a per-resume frame, which is the shape
+	// GetOrCreateGuestContextTransferStub already uses for the other transfer path.
+	// Slot 0 is the host stack pointer the return stub reads back out of TLS, so the
+	// frame replaces the single-qword allocation that slot always needed.
+	private const int ContinuationFrameQwords = 20;
+	private const int ContinuationFrameRip = 1 * sizeof(ulong);
+	private const int ContinuationFrameRsp = 2 * sizeof(ulong);
+	private const int ContinuationFrameRax = 3 * sizeof(ulong);
+	private const int ContinuationFrameMxcsr = 18 * sizeof(ulong);
+	private const int ContinuationFrameFpuControl = 19 * sizeof(ulong);
+
+	private readonly object _continuationStubGate = new();
+
+	private nint _continuationStub;
+
 	private long _importDispatchCount;
 
 	private const int ImportDispatchBlockSize = 256;
@@ -895,6 +918,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		var nativeEntry = (delegate* unmanaged[Cdecl]<int>)entry;
 		return nativeEntry();
+	}
+
+	/// <summary>
+	/// The same call with a pointer in the first integer argument register: how the
+	/// shared continuation stub is told which frame to resume from.
+	/// </summary>
+	private unsafe static int CallNativeEntryWithFrame(void* entry, nint frame)
+	{
+		var nativeEntry = (delegate* unmanaged[Cdecl]<nint, int>)entry;
+		return nativeEntry(frame);
 	}
 
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
@@ -2003,6 +2036,102 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		error = null;
 		return true;
+	}
+
+	/// <summary><c>mov &lt;register&gt;, [r11+displacement]</c>.</summary>
+	private static void EmitLoadFromContinuationFrame(ref NativeCodeEmitter emitter, int register, int displacement)
+	{
+		emitter.Emit((byte)(0x49 | (register >= 8 ? 0x04 : 0x00)));
+		emitter.Emit((byte)0x8B);
+		emitter.Emit((byte)(0x80 | ((register & 7) << 3) | 0x03));
+		emitter.Emit((uint)displacement);
+	}
+
+	/// <summary>
+	/// Emitted once and never rewritten: the blocked-thread resume, driven entirely by
+	/// the frame whose address arrives in the first integer argument register.
+	/// Everything the per-resume trampoline carried as an immediate is a load from r11
+	/// here, so nothing on this path modifies executable memory.
+	/// </summary>
+	private unsafe nint GetOrCreateContinuationStub()
+	{
+		if (Volatile.Read(ref _continuationStub) != 0)
+		{
+			return _continuationStub;
+		}
+
+		lock (_continuationStubGate)
+		{
+			if (_continuationStub != 0)
+			{
+				return _continuationStub;
+			}
+
+			const uint stubSize = 512u;
+			var code = (byte*)VirtualAlloc(null, stubSize, 12288u, 4u);
+			if (code == null)
+			{
+				return 0;
+			}
+
+			var emitter = new NativeCodeEmitter(code);
+
+			// Take the frame pointer before anything else touches a register: SysV
+			// passes the first integer argument in rdi and Win64 in rcx, and both are
+			// guest registers this stub loads further down.
+			emitter.Emit(0x49); emitter.Emit(0x89);
+			emitter.Emit(OperatingSystem.IsWindows() ? (byte)0xCB : (byte)0xFB); // mov r11, rcx / rdi
+
+			emitter.Emit(0x53); // push rbx
+			emitter.Emit(0x55); // push rbp
+			emitter.Emit(0x57); // push rdi
+			emitter.Emit(0x56); // push rsi
+			emitter.Emit(0x41); emitter.Emit(0x54); // push r12
+			emitter.Emit(0x41); emitter.Emit(0x55); // push r13
+			emitter.Emit(0x41); emitter.Emit(0x56); // push r14
+			emitter.Emit(0x41); emitter.Emit(0x57); // push r15
+			EmitHostNonvolatileXmmSave(code, ref emitter.Offset);
+
+			// The fiber's floating-point control environment, straight out of the frame
+			// rather than through a scratch slot on the host stack.
+			emitter.Emit(0x41); emitter.Emit(0x0F); emitter.Emit(0xAE); emitter.Emit(0x93); // ldmxcsr [r11+disp32]
+			emitter.Emit((uint)ContinuationFrameMxcsr);
+			emitter.Emit(0x41); emitter.Emit(0xD9); emitter.Emit(0xAB);                     // fldcw [r11+disp32]
+			emitter.Emit((uint)ContinuationFrameFpuControl);
+
+			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x23); // mov [r11], rsp
+
+			EmitLoadFromContinuationFrame(ref emitter, 4, ContinuationFrameRsp);             // mov rsp, guest rsp
+			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // reserve transfer slot
+			EmitLoadFromContinuationFrame(ref emitter, 0, ContinuationFrameRip);
+			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0x04); emitter.Emit(0x24); // mov [rsp],rax
+			EmitLoadFromContinuationFrame(ref emitter, 1, 4 * sizeof(ulong));   // rcx
+			EmitLoadFromContinuationFrame(ref emitter, 2, 5 * sizeof(ulong));   // rdx
+			EmitLoadFromContinuationFrame(ref emitter, 3, 6 * sizeof(ulong));   // rbx
+			EmitLoadFromContinuationFrame(ref emitter, 5, 7 * sizeof(ulong));   // rbp
+			EmitLoadFromContinuationFrame(ref emitter, 6, 8 * sizeof(ulong));   // rsi
+			EmitLoadFromContinuationFrame(ref emitter, 7, 9 * sizeof(ulong));   // rdi
+			EmitLoadFromContinuationFrame(ref emitter, 8, 10 * sizeof(ulong));  // r8
+			EmitLoadFromContinuationFrame(ref emitter, 9, 11 * sizeof(ulong));  // r9
+			EmitLoadFromContinuationFrame(ref emitter, 10, 12 * sizeof(ulong)); // r10
+			EmitLoadFromContinuationFrame(ref emitter, 12, 14 * sizeof(ulong)); // r12
+			EmitLoadFromContinuationFrame(ref emitter, 13, 15 * sizeof(ulong)); // r13
+			EmitLoadFromContinuationFrame(ref emitter, 14, 16 * sizeof(ulong)); // r14
+			EmitLoadFromContinuationFrame(ref emitter, 15, 17 * sizeof(ulong)); // r15
+			EmitLoadFromContinuationFrame(ref emitter, 0, ContinuationFrameRax);
+			EmitLoadFromContinuationFrame(ref emitter, 11, 13 * sizeof(ulong)); // r11 last: the frame pointer until now
+			emitter.Emit(0xC3); // ret through the synthetic transfer slot
+
+			uint oldProtect = default;
+			if (!VirtualProtect(code, stubSize, 32u, &oldProtect))
+			{
+				VirtualFree(code, 0u, 32768u);
+				return 0;
+			}
+			FlushInstructionCache(GetCurrentProcess(), code, (nuint)emitter.Offset);
+			Volatile.Write(ref _continuationStub, (nint)code);
+			return _continuationStub;
+		}
 	}
 
 	private unsafe nint GetOrCreateGuestContextTransferStub()
@@ -5965,17 +6094,28 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
+		// tbb_thead runs its stub on a rented native worker, which enters it with none
+		// of our registers set, so the shared stub cannot be handed its frame there.
+		// That path keeps the trampoline it has always had.
+		var rewritten = name == "tbb_thead";
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
-		if (ptr == null)
+		void* ptr = null;
+		if (rewritten)
 		{
-			reason = "failed to allocate executable memory for guest thread stub";
-			return GuestNativeCallExitReason.Exception;
+			ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
+			if (ptr == null)
+			{
+				reason = "failed to allocate executable memory for guest thread stub";
+				return GuestNativeCallExitReason.Exception;
+			}
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
-		if (hostRspStorage == null)
+		var frame = (ulong*)NativeMemory.AllocZeroed(ContinuationFrameQwords, sizeof(ulong));
+		if (frame == null)
 		{
-			VirtualFree(ptr, 0u, 32768u);
+			if (ptr != null)
+			{
+				VirtualFree(ptr, 0u, 32768u);
+			}
 			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
 			return GuestNativeCallExitReason.Exception;
 		}
@@ -5997,74 +6137,62 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
-			byte* ptr2 = (byte*)ptr;
-			ulong hostRspSlot = (ulong)hostRspStorage;
-			var emitter = new NativeCodeEmitter(ptr2);
-
-			emitter.Emit(0x53); // push rbx
-			emitter.Emit(0x55); // push rbp
-			emitter.Emit(0x57); // push rdi
-			emitter.Emit(0x56); // push rsi
-			emitter.Emit(0x41); emitter.Emit(0x54); // push r12
-			emitter.Emit(0x41); emitter.Emit(0x55); // push r13
-			emitter.Emit(0x41); emitter.Emit(0x56); // push r14
-			emitter.Emit(0x41); emitter.Emit(0x57); // push r15
-			EmitHostNonvolatileXmmSave(ptr2, ref emitter.Offset);
-			// Restore the fiber's floating-point control environment before
-			// abandoning the host stack. This path is used when a blocked guest
-			// continuation migrates to another managed worker.
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // sub rsp,8
-			emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov dword [rsp],imm32
-			emitter.Emit(context.Mxcsr);
-			emitter.Emit(0x0F); emitter.Emit(0xAE); emitter.Emit(0x14); emitter.Emit(0x24); // ldmxcsr [rsp]
-			emitter.Emit(0x66); emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov word [rsp],imm16
-			emitter.Emit(context.FpuControlWord);
-			emitter.Emit(0xD9); emitter.Emit(0x2C); emitter.Emit(0x24); // fldcw [rsp]
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xC4); emitter.Emit(0x08); // add rsp,8
-			emitter.EmitMovR64Immediate(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
-			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10], rsp
-			emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
-			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0xC4); // mov rsp, rax
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // reserve transfer slot
-			emitter.EmitMovR64Immediate(0x48, 0xB8, entryPoint); // mov rax, entryPoint
-			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0x04); emitter.Emit(0x24); // mov [rsp],rax
-			emitter.EmitMovR64Immediate(0x48, 0xBB, context[CpuRegister.Rbx]); // mov rbx, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBD, context[CpuRegister.Rbp]); // mov rbp, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBF, context[CpuRegister.Rdi]); // mov rdi, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBE, context[CpuRegister.Rsi]); // mov rsi, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBA, context[CpuRegister.Rdx]); // mov rdx, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xB9, context[CpuRegister.Rcx]); // mov rcx, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xB8, context[CpuRegister.R8]); // mov r8, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xB9, context[CpuRegister.R9]); // mov r9, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBA, context[CpuRegister.R10]); // mov r10, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBC, context[CpuRegister.R12]); // mov r12, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBD, context[CpuRegister.R13]); // mov r13, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBE, context[CpuRegister.R14]); // mov r14, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBF, context[CpuRegister.R15]); // mov r15, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBB, context[CpuRegister.R11]); // mov r11, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rax]); // mov rax, imm64
-			emitter.Emit(0xC3); // ret through the synthetic transfer slot
+			ulong hostRspSlot = (ulong)frame;
+			void* entryStub;
+			if (!rewritten)
+			{
+				frame[ContinuationFrameRip / sizeof(ulong)] = entryPoint;
+				frame[ContinuationFrameRsp / sizeof(ulong)] = context[CpuRegister.Rsp];
+				frame[ContinuationFrameRax / sizeof(ulong)] = context[CpuRegister.Rax];
+				frame[4] = context[CpuRegister.Rcx];
+				frame[5] = context[CpuRegister.Rdx];
+				frame[6] = context[CpuRegister.Rbx];
+				frame[7] = context[CpuRegister.Rbp];
+				frame[8] = context[CpuRegister.Rsi];
+				frame[9] = context[CpuRegister.Rdi];
+				frame[10] = context[CpuRegister.R8];
+				frame[11] = context[CpuRegister.R9];
+				frame[12] = context[CpuRegister.R10];
+				frame[13] = context[CpuRegister.R11];
+				frame[14] = context[CpuRegister.R12];
+				frame[15] = context[CpuRegister.R13];
+				frame[16] = context[CpuRegister.R14];
+				frame[17] = context[CpuRegister.R15];
+				frame[ContinuationFrameMxcsr / sizeof(ulong)] = context.Mxcsr;
+				frame[ContinuationFrameFpuControl / sizeof(ulong)] = context.FpuControlWord;
+				entryStub = (void*)GetOrCreateContinuationStub();
+				if (entryStub == null)
+				{
+					reason = "failed to create the shared guest continuation stub";
+					return GuestNativeCallExitReason.Exception;
+				}
+			}
+			else
+			{
+				EmitContinuationTrampoline((byte*)ptr, context, entryPoint, hostRspSlot);
+				uint oldProtect = default(uint);
+				if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+				{
+					reason = "failed to seal guest continuation stub execute-read";
+					return GuestNativeCallExitReason.Exception;
+				}
+				FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
+				entryStub = ptr;
+			}
 			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
 			if (returnSlotAddress == 0 || !context.TryWriteUInt64(returnSlotAddress, (ulong)_guestReturnStub))
 			{
 				reason = $"failed to patch guest continuation return slot at 0x{returnSlotAddress:X16}";
 				return GuestNativeCallExitReason.Exception;
 			}
-			uint oldProtect = default(uint);
-			if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
-			{
-				reason = "failed to seal guest continuation stub execute-read";
-				return GuestNativeCallExitReason.Exception;
-			}
-			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
 			ActiveGuestThreadYieldRequested = false;
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
 				int nativeReturn;
-				if (name == "tbb_thead")
+				if (rewritten)
 				{
-					nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
+					nativeReturn = RunGuestEntryStub(entryStub, hostRspSlot, requireNativeWorker: true);
 				}
 				else
 				{
@@ -6073,7 +6201,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						reason = "failed to bind host-RSP storage for guest continuation stub";
 						return GuestNativeCallExitReason.Exception;
 					}
-					nativeReturn = CallNativeEntry(ptr);
+					nativeReturn = CallNativeEntryWithFrame(entryStub, (nint)frame);
 				}
 				if (ActiveGuestThreadYieldRequested)
 				{
@@ -6110,9 +6238,66 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
-			NativeMemory.Free(hostRspStorage);
-			VirtualFree(ptr, 0u, 32768u);
+			NativeMemory.Free(frame);
+			if (ptr != null)
+			{
+				VirtualFree(ptr, 0u, 32768u);
+			}
 		}
+	}
+
+	/// <summary>
+	/// The per-resume trampoline, kept for the one path the shared stub cannot serve:
+	/// tbb_thead enters its stub on a rented native worker with none of our registers
+	/// set, so there is nowhere to hand it a frame pointer.
+	/// </summary>
+	private unsafe static void EmitContinuationTrampoline(byte* ptr2, CpuContext context, ulong entryPoint, ulong hostRspSlot)
+	{
+		var emitter = new NativeCodeEmitter(ptr2);
+
+		emitter.Emit(0x53); // push rbx
+		emitter.Emit(0x55); // push rbp
+		emitter.Emit(0x57); // push rdi
+		emitter.Emit(0x56); // push rsi
+		emitter.Emit(0x41); emitter.Emit(0x54); // push r12
+		emitter.Emit(0x41); emitter.Emit(0x55); // push r13
+		emitter.Emit(0x41); emitter.Emit(0x56); // push r14
+		emitter.Emit(0x41); emitter.Emit(0x57); // push r15
+		EmitHostNonvolatileXmmSave(ptr2, ref emitter.Offset);
+		// Restore the fiber's floating-point control environment before
+		// abandoning the host stack. This path is used when a blocked guest
+		// continuation migrates to another managed worker.
+		emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // sub rsp,8
+		emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov dword [rsp],imm32
+		emitter.Emit(context.Mxcsr);
+		emitter.Emit(0x0F); emitter.Emit(0xAE); emitter.Emit(0x14); emitter.Emit(0x24); // ldmxcsr [rsp]
+		emitter.Emit(0x66); emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov word [rsp],imm16
+		emitter.Emit(context.FpuControlWord);
+		emitter.Emit(0xD9); emitter.Emit(0x2C); emitter.Emit(0x24); // fldcw [rsp]
+		emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xC4); emitter.Emit(0x08); // add rsp,8
+		emitter.EmitMovR64Immediate(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
+		emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10], rsp
+		emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
+		emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0xC4); // mov rsp, rax
+		emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // reserve transfer slot
+		emitter.EmitMovR64Immediate(0x48, 0xB8, entryPoint); // mov rax, entryPoint
+		emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0x04); emitter.Emit(0x24); // mov [rsp],rax
+		emitter.EmitMovR64Immediate(0x48, 0xBB, context[CpuRegister.Rbx]); // mov rbx, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xBD, context[CpuRegister.Rbp]); // mov rbp, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xBF, context[CpuRegister.Rdi]); // mov rdi, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xBE, context[CpuRegister.Rsi]); // mov rsi, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xBA, context[CpuRegister.Rdx]); // mov rdx, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xB9, context[CpuRegister.Rcx]); // mov rcx, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xB8, context[CpuRegister.R8]); // mov r8, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xB9, context[CpuRegister.R9]); // mov r9, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBA, context[CpuRegister.R10]); // mov r10, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBC, context[CpuRegister.R12]); // mov r12, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBD, context[CpuRegister.R13]); // mov r13, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBE, context[CpuRegister.R14]); // mov r14, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBF, context[CpuRegister.R15]); // mov r15, imm64
+		emitter.EmitMovR64Immediate(0x49, 0xBB, context[CpuRegister.R11]); // mov r11, imm64
+		emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rax]); // mov rax, imm64
+		emitter.Emit(0xC3); // ret through the synthetic transfer slot
 	}
 
 	// The continuation trampoline is rebuilt on every blocked-thread resume.
@@ -7251,6 +7436,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			VirtualFree((void*)_guestContextTransferStub, 0u, 32768u);
 			_guestContextTransferStub = 0;
+		}
+		if (_continuationStub != 0)
+		{
+			VirtualFree((void*)_continuationStub, 0u, 32768u);
+			_continuationStub = 0;
 		}
 		foreach (var frame in _guestContextTransferFrames.Values)
 		{
