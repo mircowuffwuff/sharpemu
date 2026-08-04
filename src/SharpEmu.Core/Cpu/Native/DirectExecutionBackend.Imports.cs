@@ -340,6 +340,7 @@ public sealed partial class DirectExecutionBackend
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			NoteResumeLanding(activeGuestThreadState, num7, importStackPointer, importStubEntry.Nid);
 		}
 		if (_logStrlenBursts)
 		{
@@ -1378,6 +1379,7 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			NoteResumeLanding(activeGuestThreadState, returnRip, leafStackPointer, importStubEntry.Nid);
 		}
 		if (_logImportPeriodic && dispatchIndex % 100000 == 0)
 		{
@@ -1816,9 +1818,54 @@ public sealed partial class DirectExecutionBackend
 		if (_logGuestThreads)
 		{
 			Console.Error.WriteLine(
-				$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason}");
+				$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: " +
+				$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+				$"nid={nid} ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason}");
 		}
 		return true;
+	}
+
+	// DIAGNOSTIC (audio stall, item 16). A cooperatively blocked thread is resumed by
+	// jumping straight to the return address of the import it blocked in. Nothing has
+	// ever checked that the guest arrives there: the first import it dispatches after a
+	// resume is the cheapest witness, and its own return address plus the stack pointer
+	// it was called on say both where the guest is and which frame it is in.
+	private void NoteResumeLanding(GuestThreadState thread, ulong returnRip, ulong importStackPointer, string nid)
+	{
+		var expectedRip = Volatile.Read(ref thread.PendingResumeRip);
+		if (expectedRip == 0)
+		{
+			return;
+		}
+
+		Volatile.Write(ref thread.PendingResumeRip, 0);
+		if (!_logGuestThreads)
+		{
+			return;
+		}
+
+		var expectedRsp = Volatile.Read(ref thread.PendingResumeRsp);
+		var dRip = unchecked((long)returnRip - (long)expectedRip);
+		var dRsp = unchecked((long)importStackPointer - (long)expectedRsp);
+
+		// Only the first two sightings of a (site, distance, frame) triple, so a
+		// steady-state run is silent and a landing this thread has never made
+		// before is not competing with a third of a million lines for attention.
+		var seen = thread.ResumeLandings ??= new Dictionary<(ulong, long, long), int>();
+		var key = (expectedRip, dRip, dRsp);
+		seen.TryGetValue(key, out var already);
+		seen[key] = already + 1;
+		if (already >= 2 || seen.Count > 4096)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] resume-landed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
+			$"expect_rip=0x{expectedRip:X16} expect_rsp=0x{expectedRsp:X16} " +
+			$"prev_rip=0x{thread.PrevResumeRip:X16} " +
+			$"first_ret=0x{returnRip:X16} first_rsp=0x{importStackPointer:X16} " +
+			$"d_rip={dRip} d_rsp={dRsp} seen={already + 1} sites={seen.Count} nid={nid}");
 	}
 
 	private bool TryPatchActiveGuestReturnSlot(ulong hostExit)

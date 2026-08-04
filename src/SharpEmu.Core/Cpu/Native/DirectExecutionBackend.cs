@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
@@ -301,6 +301,75 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private nint _guestContextTransferStub;
 
+	// DIAGNOSTIC (audio stall, item 16): how often the per-resume continuation
+	// trampoline lands on an address it has already used.
+	private long _lastContinuationStubAddress;
+	private long _continuationStubAddressChanges;
+	private long _continuationStubAllocations;
+
+	// DIAGNOSTIC (audio stall, item 16): the direct test of "the guest ran a stub an
+	// earlier resume wrote". Each resume takes a slot out of a per-host-thread ring
+	// that is never freed, zeroes it, and has its own trampoline store a serial into
+	// it as the trampoline's first act. If the slot is still zero when the guest comes
+	// back, the bytes we just wrote were not what executed. A stale trampoline writes
+	// an older slot of the same ring, which is harmless by construction.
+	private const int ContinuationWitnessSlots = 64;
+
+	private readonly ThreadLocal<nint> _continuationWitnessRings = new(
+		static () => (nint)NativeMemory.AllocZeroed(ContinuationWitnessSlots, sizeof(ulong)),
+		trackAllValues: true);
+
+	[ThreadStatic]
+	private static int _continuationWitnessNext;
+
+	private long _continuationWitnessSerial;
+	private long _continuationWitnessMisses;
+
+	// DIAGNOSTIC (audio stall, item 16): the positive control on the witness. A probe
+	// that reports nothing has to be told apart from a probe that never ran, so every
+	// witnessed resume is counted and the running total is printed periodically -- "0
+	// misses" is then a measurement over a known number of observations rather than
+	// silence. SHARPEMU_WITNESS_SELFTEST=N omits the store on every Nth resume, which
+	// must produce a MISS; if it does not, the instrument is broken.
+	private long _continuationWitnessObservations;
+	private int _witnessSelfTestEvery;
+
+	private const long ContinuationWitnessReportEvery = 2048;
+
+	// The blocked-thread resume path used to write a fresh trampoline into an mmap'd
+	// page and release it again on every resume -- ~400 times a second, with the
+	// target RIP and all sixteen registers baked in as immediates. That is free on a
+	// CPU with a coherent instruction cache and is not free under a recompiler: the
+	// same address holds different code on consecutive resumes, and the witness above
+	// caught the guest running an *earlier* resume's trampoline hundreds of times in a
+	// 95 s run. This is the same answer GetOrCreateGuestContextTransferStub already
+	// gives the other transfer path -- one permanent stub that reads a per-thread data
+	// frame through r11 -- so there is no self-modifying code left on the path and no
+	// mmap/mprotect/munmap per resume either.
+	//
+	// SHARPEMU_REWRITE_CONTINUATION_STUBS=1 puts the old path back, so the two are one
+	// build launched two ways rather than two builds.
+	private bool _rewriteContinuationStubs;
+
+	private readonly object _continuationStubGate = new();
+
+	private nint _continuationStub;
+
+	// Slots 0..18 are laid out exactly as the guest-context transfer frame's are, so
+	// the two are readable side by side. 19 is that frame's RestoreFullFpuState and is
+	// deliberately left unused here.
+	private const int ContinuationFrameQwords = 24;
+	private const int ContinuationFrameMxcsr = 17 * 8;
+	private const int ContinuationFrameFpuControl = 18 * 8;
+	private const int ContinuationFrameHostRspSlot = 20 * 8;
+	private const int ContinuationFrameWitness = 21 * 8;
+	private const int ContinuationFrameWitnessSerial = 22 * 8;
+	private const int ContinuationFrameScratch = 23 * 8;
+
+	private readonly ThreadLocal<nint> _continuationFrames = new(
+		static () => (nint)NativeMemory.AllocZeroed(ContinuationFrameQwords, sizeof(ulong)),
+		trackAllValues: true);
+
 	private long _importDispatchCount;
 
 	private const int ImportDispatchBlockSize = 256;
@@ -338,6 +407,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private int _ignoredGuestInt41Count;
 
 	private bool _logGuestThreads;
+
+	// DIAGNOSTIC (audio stall, item 16): SHARPEMU_LEAK_CONTINUATION_STUBS=1 stops the
+	// per-resume trampoline page being released, so no address is ever reused. One build
+	// serves both arms of the A/B: the payload bytes are identical and only the flag differs.
+	private bool _leakContinuationStubs;
+
+	// DIAGNOSTIC (audio stall, item 16): SHARPEMU_WITNESS_CONTINUATION_STUBS=1.
+	private bool _witnessContinuationStubs;
 
 	private bool _logUsleep;
 
@@ -471,6 +548,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public string? LastImportNid;
 
 		public ulong LastReturnRip;
+
+		// DIAGNOSTIC (audio stall, item 16): what the last resume told this thread
+		// to land on, so the first import after it can be compared against it.
+		// PrevResumeRip is the resume before that one, because the suspect is a
+		// thread arriving on its own previous continuation rather than this one.
+		public ulong PendingResumeRip;
+		public ulong PendingResumeRsp;
+		public ulong CurrentResumeRip;
+		public ulong PrevResumeRip;
+
+		// Every landing would be ~370 lines a second and this bug is sensitive to
+		// log volume, so only landings this thread has not made before are printed:
+		// (resume point, distance travelled, frame delta) seen twice, then silent.
+		public Dictionary<(ulong Site, long DRip, long DRsp), int>? ResumeLandings;
 
 		// Busy guest workers overwrite the global recent-import ring. Preserve
 		// the most recent complete SysV call frame per guest thread so native
@@ -899,6 +990,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return nativeEntry();
 	}
 
+	/// <summary>
+	/// Same call, with a pointer in the platform's first integer argument register:
+	/// how the shared continuation stub is told which frame to resume from.
+	/// </summary>
+	private unsafe static int CallNativeEntryWithFrame(void* entry, nint frame)
+	{
+		var nativeEntry = (delegate* unmanaged[Cdecl]<nint, int>)entry;
+		return nativeEntry(frame);
+	}
+
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
 	{
 		*(ulong*)((byte*)contextRecord + offset) = value;
@@ -1162,6 +1263,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			!string.Equals(ignoreGuestInt41Env, "false", StringComparison.OrdinalIgnoreCase);
 		_ignoredGuestInt41Count = 0;
 		_logGuestThreads = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
+		_leakContinuationStubs = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LEAK_CONTINUATION_STUBS"), "1", StringComparison.Ordinal);
+		_witnessContinuationStubs = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_WITNESS_CONTINUATION_STUBS"), "1", StringComparison.Ordinal);
+		_witnessSelfTestEvery = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_WITNESS_SELFTEST"), out var witnessSelfTestEvery) && witnessSelfTestEvery > 0
+			? witnessSelfTestEvery
+			: 0;
+		_rewriteContinuationStubs = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_REWRITE_CONTINUATION_STUBS"), "1", StringComparison.Ordinal);
+		Console.Error.WriteLine(
+			"[LOADER][INFO] guest continuation resume: " +
+			(_rewriteContinuationStubs ? "a trampoline rewritten per resume (the control arm)" : "one permanent stub and a per-thread frame"));
+		if (_witnessContinuationStubs)
+		{
+			Console.Error.WriteLine(
+				"[LOADER][INFO] continuation-stub witness armed" +
+				(_witnessSelfTestEvery > 0 ? $" (self-test: every {_witnessSelfTestEvery} resumes omits the store)" : string.Empty));
+		}
 		_logUsleep = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
 		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
@@ -5509,12 +5625,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				continuation = continuation with { Rax = unchecked((ulong)(long)blockWaiter.Resume()) };
 			}
 
+			// DIAGNOSTIC (audio stall, item 16): the thread handle is on these lines
+			// because eleven live guest threads share the name 'ratamedia streamer',
+			// so a name alone cannot say which one was pumped.
+			thread.PrevResumeRip = thread.CurrentResumeRip;
+			thread.CurrentResumeRip = resumeContinuation ? continuation.Rip : 0;
+			Volatile.Write(ref thread.PendingResumeRip, resumeContinuation ? continuation.Rip : 0);
+			Volatile.Write(ref thread.PendingResumeRsp, resumeContinuation ? continuation.Rsp : 0);
 			if (_logGuestThreads)
 			{
 				Console.Error.WriteLine(
 					resumeContinuation
-						? $"[LOADER][INFO] Pumping guest thread '{thread.Name}' reason={reason} resume=0x{continuation.Rip:X16}"
-						: $"[LOADER][INFO] Pumping guest thread '{thread.Name}' reason={reason} entry=0x{thread.EntryPoint:X16}");
+						? $"[LOADER][INFO] Pumping guest thread '{thread.Name}' thread=0x{thread.ThreadHandle:X16} reason={reason} " +
+							$"resume=0x{continuation.Rip:X16} rsp=0x{continuation.Rsp:X16} rax=0x{continuation.Rax:X16} " +
+							$"slot=0x{continuation.ReturnSlotAddress:X16}"
+						: $"[LOADER][INFO] Pumping guest thread '{thread.Name}' thread=0x{thread.ThreadHandle:X16} reason={reason} " +
+							$"entry=0x{thread.EntryPoint:X16}");
 			}
 			var exitReason = resumeContinuation
 				? ExecuteBlockedGuestThreadContinuation(thread.Context, continuation, thread.Name, out var blockReason)
@@ -5556,7 +5682,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (_logGuestThreads)
 			{
 				Console.Error.WriteLine(
-					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"}");
+					$"[LOADER][INFO] Guest thread '{thread.Name}' thread=0x{thread.ThreadHandle:X16} " +
+					$"state={thread.State} reason={blockReason ?? "none"}");
 			}
 		}
 		finally
@@ -5873,6 +6000,294 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	/// <summary>
+	/// <c>mov &lt;register&gt;, [r11+displacement]</c>. A free function rather than a local
+	/// one because NativeCodeEmitter is a ref struct and cannot be captured.
+	/// </summary>
+	private static void EmitLoadFromContinuationFrame(ref NativeCodeEmitter emitter, int register, int displacement)
+	{
+		emitter.Emit((byte)(0x49 | (register >= 8 ? 0x04 : 0x00)));
+		emitter.Emit((byte)0x8B);
+		emitter.Emit((byte)(0x80 | ((register & 7) << 3) | 0x03));
+		emitter.Emit((uint)displacement);
+	}
+
+	/// <summary>
+	/// The permanent half of the blocked-thread resume: emitted once, never rewritten,
+	/// and driven entirely by the per-thread frame whose address arrives in the
+	/// platform's first integer argument register. Everything the old per-resume
+	/// trampoline carried as an immediate is a load from r11 here.
+	/// </summary>
+	private unsafe nint GetOrCreateContinuationStub()
+	{
+		if (Volatile.Read(ref _continuationStub) != 0)
+		{
+			return _continuationStub;
+		}
+
+		lock (_continuationStubGate)
+		{
+			if (_continuationStub != 0)
+			{
+				return _continuationStub;
+			}
+
+			const uint stubSize = 512u;
+			var code = (byte*)VirtualAlloc(null, stubSize, 12288u, 4u);
+			if (code == null)
+			{
+				return 0;
+			}
+
+			var emitter = new NativeCodeEmitter(code);
+
+			// The frame pointer, before anything else touches a register: SysV puts the
+			// first integer argument in rdi and Win64 puts it in rcx, and both are guest
+			// registers this stub loads further down.
+			emitter.Emit(0x49); emitter.Emit(0x89);
+			emitter.Emit(OperatingSystem.IsWindows() ? (byte)0xCB : (byte)0xFB); // mov r11, rcx / rdi
+
+			emitter.Emit(0x53); // push rbx
+			emitter.Emit(0x55); // push rbp
+			emitter.Emit(0x57); // push rdi
+			emitter.Emit(0x56); // push rsi
+			emitter.Emit(0x41); emitter.Emit(0x54); // push r12
+			emitter.Emit(0x41); emitter.Emit(0x55); // push r13
+			emitter.Emit(0x41); emitter.Emit(0x56); // push r14
+			emitter.Emit(0x41); emitter.Emit(0x57); // push r15
+			EmitHostNonvolatileXmmSave(code, ref emitter.Offset);
+
+			// The fiber's floating-point control environment, straight out of the frame
+			// rather than through a scratch slot on the host stack.
+			emitter.Emit(0x41); emitter.Emit(0x0F); emitter.Emit(0xAE); emitter.Emit(0x93); // ldmxcsr [r11+disp32]
+			emitter.Emit((uint)ContinuationFrameMxcsr);
+			emitter.Emit(0x41); emitter.Emit(0xD9); emitter.Emit(0xAB);                     // fldcw [r11+disp32]
+			emitter.Emit((uint)ContinuationFrameFpuControl);
+
+			EmitLoadFromContinuationFrame(ref emitter, 10, ContinuationFrameHostRspSlot);
+			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10], rsp
+
+			// The witness slot is always written, because the frame always names one:
+			// a run without SHARPEMU_WITNESS_CONTINUATION_STUBS points it at the frame's
+			// own scratch qword rather than branching here.
+			EmitLoadFromContinuationFrame(ref emitter, 10, ContinuationFrameWitness);
+			EmitLoadFromContinuationFrame(ref emitter, 0, ContinuationFrameWitnessSerial);
+			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x02); // mov [r10], rax
+
+			EmitLoadFromContinuationFrame(ref emitter, 4, 8);                                                            // mov rsp, [r11+8]
+			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // sub rsp,8
+			EmitLoadFromContinuationFrame(ref emitter, 0, 0);                                                            // mov rax, [r11+0] (rip)
+			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0x04); emitter.Emit(0x24); // mov [rsp], rax
+			EmitLoadFromContinuationFrame(ref emitter, 1, 3 * 8);   // rcx
+			EmitLoadFromContinuationFrame(ref emitter, 2, 4 * 8);   // rdx
+			EmitLoadFromContinuationFrame(ref emitter, 3, 5 * 8);   // rbx
+			EmitLoadFromContinuationFrame(ref emitter, 5, 6 * 8);   // rbp
+			EmitLoadFromContinuationFrame(ref emitter, 6, 7 * 8);   // rsi
+			EmitLoadFromContinuationFrame(ref emitter, 7, 8 * 8);   // rdi
+			EmitLoadFromContinuationFrame(ref emitter, 8, 9 * 8);   // r8
+			EmitLoadFromContinuationFrame(ref emitter, 9, 10 * 8);  // r9
+			EmitLoadFromContinuationFrame(ref emitter, 10, 11 * 8); // r10
+			EmitLoadFromContinuationFrame(ref emitter, 12, 13 * 8); // r12
+			EmitLoadFromContinuationFrame(ref emitter, 13, 14 * 8); // r13
+			EmitLoadFromContinuationFrame(ref emitter, 14, 15 * 8); // r14
+			EmitLoadFromContinuationFrame(ref emitter, 15, 16 * 8); // r15
+			EmitLoadFromContinuationFrame(ref emitter, 0, 2 * 8);   // rax
+			EmitLoadFromContinuationFrame(ref emitter, 11, 12 * 8); // r11 last: it is the frame pointer until this load
+			emitter.Emit(0xC3); // ret through the synthetic transfer slot
+
+			uint oldProtect = default;
+			if (!VirtualProtect(code, stubSize, 32u, &oldProtect))
+			{
+				VirtualFree(code, 0u, 32768u);
+				return 0;
+			}
+			FlushInstructionCache(GetCurrentProcess(), code, (nuint)emitter.Offset);
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] continuation stub is permanent at 0x{(ulong)code:X16} ({emitter.Offset} bytes)");
+			Volatile.Write(ref _continuationStub, (nint)code);
+			return _continuationStub;
+		}
+	}
+
+	/// <summary>
+	/// A blocked-thread resume through the permanent stub: fill this thread's frame,
+	/// hand its address to the stub, and let the guest come back through the same
+	/// return stub as before. No allocation, no mprotect and no executable byte
+	/// changes anywhere on the path.
+	/// </summary>
+	private unsafe GuestNativeCallExitReason ExecuteGuestContinuationEntryViaSharedStub(
+		CpuContext context,
+		ulong entryPoint,
+		ulong returnSlotAddress,
+		string name,
+		out string? reason)
+	{
+		reason = null;
+		var stub = GetOrCreateContinuationStub();
+		if (stub == 0)
+		{
+			reason = "failed to create the shared guest continuation stub";
+			return GuestNativeCallExitReason.Exception;
+		}
+
+		var frameAddress = _continuationFrames.Value;
+		if (frameAddress == 0)
+		{
+			reason = "failed to allocate a guest continuation frame";
+			return GuestNativeCallExitReason.Exception;
+		}
+
+		// Still per resume, and still freed in the finally: the return stub reads the
+		// host stack pointer back out of it through TLS, and a resume can nest inside
+		// an import dispatched by an outer one.
+		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		if (hostRspStorage == null)
+		{
+			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
+			return GuestNativeCallExitReason.Exception;
+		}
+
+		var previousActiveBackend = _activeExecutionBackend;
+		var previousActiveContext = _activeCpuContext;
+		var previousSentinel = _activeEntryReturnSentinelRip;
+		var previousReturnSlotAddress = _activeGuestReturnSlotAddress;
+		var previousForcedExit = _activeForcedGuestExit;
+		var previousYieldRequested = _activeGuestThreadYieldRequested;
+		var previousYieldReason = _activeGuestThreadYieldReason;
+		nint previousHostRspSlotValue = TlsGetValue(_hostRspSlotTlsIndex);
+
+		var frame = (ulong*)frameAddress;
+		ulong* witness = null;
+		ulong witnessSerial = 0;
+		if (_witnessContinuationStubs)
+		{
+			witness = (ulong*)_continuationWitnessRings.Value
+				+ (_continuationWitnessNext++ & (ContinuationWitnessSlots - 1));
+			*witness = 0;
+			witnessSerial = unchecked((ulong)Interlocked.Increment(ref _continuationWitnessSerial));
+			// The self-test cannot omit an instruction from a stub that is never
+			// rewritten, so it aims the store at the frame's scratch qword instead. The
+			// slot the host layer then reads is still zero, which is the same failure
+			// the probe exists to report, produced deliberately.
+			var selfTest = _witnessSelfTestEvery > 0 && (long)witnessSerial % _witnessSelfTestEvery == 0;
+			frame[ContinuationFrameWitness / 8] = selfTest
+				? (ulong)(frameAddress + ContinuationFrameScratch)
+				: (ulong)witness;
+			frame[ContinuationFrameWitnessSerial / 8] = witnessSerial;
+		}
+		else
+		{
+			frame[ContinuationFrameWitness / 8] = (ulong)(frameAddress + ContinuationFrameScratch);
+			frame[ContinuationFrameWitnessSerial / 8] = 0;
+		}
+
+		try
+		{
+			_activeExecutionBackend = this;
+			_activeCpuContext = context;
+			_activeEntryReturnSentinelRip = 0;
+			_activeGuestReturnSlotAddress = returnSlotAddress;
+			_activeForcedGuestExit = false;
+			_activeGuestThreadYieldRequested = false;
+			_activeGuestThreadYieldReason = null;
+			BindTlsBase(context);
+
+			frame[0] = entryPoint;
+			frame[1] = context[CpuRegister.Rsp];
+			frame[2] = context[CpuRegister.Rax];
+			frame[3] = context[CpuRegister.Rcx];
+			frame[4] = context[CpuRegister.Rdx];
+			frame[5] = context[CpuRegister.Rbx];
+			frame[6] = context[CpuRegister.Rbp];
+			frame[7] = context[CpuRegister.Rsi];
+			frame[8] = context[CpuRegister.Rdi];
+			frame[9] = context[CpuRegister.R8];
+			frame[10] = context[CpuRegister.R9];
+			frame[11] = context[CpuRegister.R10];
+			frame[12] = context[CpuRegister.R11];
+			frame[13] = context[CpuRegister.R12];
+			frame[14] = context[CpuRegister.R13];
+			frame[15] = context[CpuRegister.R14];
+			frame[16] = context[CpuRegister.R15];
+			frame[ContinuationFrameMxcsr / 8] = context.Mxcsr;
+			frame[ContinuationFrameFpuControl / 8] = context.FpuControlWord;
+			frame[ContinuationFrameHostRspSlot / 8] = (ulong)hostRspStorage;
+
+			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
+			if (returnSlotAddress == 0 || !context.TryWriteUInt64(returnSlotAddress, (ulong)_guestReturnStub))
+			{
+				reason = $"failed to patch guest continuation return slot at 0x{returnSlotAddress:X16}";
+				return GuestNativeCallExitReason.Exception;
+			}
+
+			ActiveGuestThreadYieldRequested = false;
+			ActiveGuestThreadYieldReason = null;
+			try
+			{
+				if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspStorage))
+				{
+					reason = "failed to bind host-RSP storage for guest continuation stub";
+					return GuestNativeCallExitReason.Exception;
+				}
+
+				var nativeReturn = CallNativeEntryWithFrame((void*)stub, frameAddress);
+				if (witness != null)
+				{
+					if (*witness != witnessSerial)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][WARN] continuation-stub witness MISS #{Interlocked.Increment(ref _continuationWitnessMisses)}: " +
+							$"stub=0x{(ulong)stub:X16} name='{name}' expected serial {witnessSerial} read {*witness} " +
+							"(the shared stub is never rewritten, so this can only be the self-test)");
+					}
+					var observations = Interlocked.Increment(ref _continuationWitnessObservations);
+					if (observations % ContinuationWitnessReportEvery == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] continuation-stub witness: {observations} resumes witnessed, " +
+							$"{Interlocked.Read(ref _continuationWitnessMisses)} misses");
+					}
+				}
+
+				if (ActiveGuestThreadYieldRequested)
+				{
+					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
+					return GuestNativeCallExitReason.Blocked;
+				}
+				if (ActiveForcedGuestExit)
+				{
+					reason = LastError ?? "guest thread forced exit";
+					return GuestNativeCallExitReason.ForcedExit;
+				}
+				reason = $"returned 0x{nativeReturn:X8}";
+				return GuestNativeCallExitReason.Returned;
+			}
+			catch (AccessViolationException ex)
+			{
+				reason = "access violation: " + ex.Message;
+				return GuestNativeCallExitReason.Exception;
+			}
+			catch (Exception ex)
+			{
+				reason = ex.GetType().Name + ": " + ex.Message;
+				return GuestNativeCallExitReason.Exception;
+			}
+		}
+		finally
+		{
+			TlsSetValue(_hostRspSlotTlsIndex, previousHostRspSlotValue);
+			RestoreActiveExecutionThread(
+				previousActiveBackend,
+				previousActiveContext,
+				previousSentinel,
+				previousReturnSlotAddress,
+				previousForcedExit,
+				previousYieldRequested,
+				previousYieldReason);
+			NativeMemory.Free(hostRspStorage);
+		}
+	}
+
 	private unsafe GuestNativeCallExitReason ExecuteGuestContinuationEntry(
 		CpuContext context,
 		ulong entryPoint,
@@ -5886,6 +6301,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
+		// tbb_thead runs its stub on a rented native worker, which enters the stub with
+		// no argument of ours in any register, so the shared stub has no way to be given
+		// its frame there. That path keeps the rewritten trampoline until the worker
+		// carries a frame pointer too.
+		if (!_rewriteContinuationStubs && name != "tbb_thead")
+		{
+			return ExecuteGuestContinuationEntryViaSharedStub(context, entryPoint, returnSlotAddress, name, out reason);
+		}
 		const uint stubSize = 512u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
@@ -5893,6 +6316,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
+		// DIAGNOSTIC (audio stall, item 16): this trampoline is written fresh and
+		// released on every resume. If the allocator keeps handing back the same
+		// address, every resume rewrites executable bytes an earlier resume already
+		// ran -- which on a JIT is a code-cache invalidation rather than a store.
+		// One line per address change, so a constant address prints once.
+		var stubAddress = (ulong)ptr;
+		if (Interlocked.Exchange(ref _lastContinuationStubAddress, unchecked((long)stubAddress)) != unchecked((long)stubAddress) &&
+			Interlocked.Increment(ref _continuationStubAddressChanges) <= 64)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] continuation-stub address 0x{stubAddress:X16} " +
+				$"(address change #{Interlocked.Read(ref _continuationStubAddressChanges)} " +
+				$"in {Interlocked.Read(ref _continuationStubAllocations) + 1} resumes)");
+		}
+		Interlocked.Increment(ref _continuationStubAllocations);
+
 		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
 		if (hostRspStorage == null)
 		{
@@ -5908,6 +6347,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var previousYieldRequested = _activeGuestThreadYieldRequested;
 		var previousYieldReason = _activeGuestThreadYieldReason;
 		nint previousHostRspSlotValue = TlsGetValue(_hostRspSlotTlsIndex);
+		ulong* witness = null;
+		ulong witnessSerial = 0;
+		bool witnessSelfTest = false;
+		if (_witnessContinuationStubs)
+		{
+			witness = (ulong*)_continuationWitnessRings.Value
+				+ (_continuationWitnessNext++ & (ContinuationWitnessSlots - 1));
+			*witness = 0;
+			witnessSerial = unchecked((ulong)Interlocked.Increment(ref _continuationWitnessSerial));
+			witnessSelfTest = _witnessSelfTestEvery > 0 && (long)witnessSerial % _witnessSelfTestEvery == 0;
+		}
 		try
 		{
 			_activeExecutionBackend = this;
@@ -5944,6 +6394,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xC4); emitter.Emit(0x08); // add rsp,8
 			emitter.EmitMovR64Immediate(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
 			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10], rsp
+			if (witness != null && !witnessSelfTest)
+			{
+				// r10 and rax are both scratch here: the guest's own values are loaded
+				// further down, after the stack has been switched.
+				emitter.EmitMovR64Immediate(0x49, 0xBA, (ulong)witness); // mov r10, witness
+				emitter.EmitMovR64Immediate(0x48, 0xB8, witnessSerial);  // mov rax, serial
+				emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x02); // mov [r10], rax
+			}
 			emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
 			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0xC4); // mov rsp, rax
 			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // reserve transfer slot
@@ -5996,6 +6454,28 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					}
 					nativeReturn = CallNativeEntry(ptr);
 				}
+				// DIAGNOSTIC (audio stall, item 16): a serial still unwritten means the
+				// trampoline emitted for *this* resume never ran -- something else did, at
+				// the same address. A stale serial names the resume it belonged to.
+				if (witness != null)
+				{
+					if (*witness != witnessSerial)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][WARN] continuation-stub witness MISS #{Interlocked.Increment(ref _continuationWitnessMisses)}: " +
+							$"stub=0x{(ulong)ptr:X16} name='{name}' expected serial {witnessSerial} " +
+							$"read {*witness}{(witnessSelfTest ? " (SELFTEST: the store was deliberately not emitted)" : " (0 means our bytes never executed)")}");
+					}
+					// The positive control: a running total, so that no MISS lines in a
+					// capture is a count of observations rather than an absence of output.
+					var observations = Interlocked.Increment(ref _continuationWitnessObservations);
+					if (observations % ContinuationWitnessReportEvery == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] continuation-stub witness: {observations} resumes witnessed, " +
+							$"{Interlocked.Read(ref _continuationWitnessMisses)} misses");
+					}
+				}
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -6032,7 +6512,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousYieldRequested,
 				previousYieldReason);
 			NativeMemory.Free(hostRspStorage);
-			VirtualFree(ptr, 0u, 32768u);
+			// DIAGNOSTIC (audio stall, item 16): deliberately NOT released, so the
+			// allocator can never hand this address back and no resume can ever run
+			// bytes a previous resume wrote. This leaks a page per resume -- about
+			// 150 MB over a 95 s run -- and exists only to A/B the address reuse.
+			if (!_leakContinuationStubs)
+			{
+				VirtualFree(ptr, 0u, 32768u);
+			}
 		}
 	}
 
@@ -7181,6 +7668,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_guestContextTransferFrames.Dispose();
+		if (_continuationStub != 0)
+		{
+			VirtualFree((void*)_continuationStub, 0u, 32768u);
+			_continuationStub = 0;
+		}
+		foreach (var frame in _continuationFrames.Values)
+		{
+			if (frame != 0)
+			{
+				NativeMemory.Free((void*)frame);
+			}
+		}
+		_continuationFrames.Dispose();
+		if (_continuationWitnessRings.Values is { } witnessRings)
+		{
+			foreach (var ring in witnessRings)
+			{
+				if (ring != 0)
+				{
+					NativeMemory.Free((void*)ring);
+				}
+			}
+		}
+		_continuationWitnessRings.Dispose();
 		if (_lowIndexedTableScratch != 0)
 		{
 			VirtualFree((void*)_lowIndexedTableScratch, 0u, 32768u);
