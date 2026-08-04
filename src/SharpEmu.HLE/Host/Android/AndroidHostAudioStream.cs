@@ -10,19 +10,21 @@ namespace SharpEmu.HLE.Host.Android;
 /// </summary>
 /// <remarks>
 /// AAudio offers two ways to feed a stream: a data callback, where a driver-owned thread calls the
-/// application every burst, and blocking writes, where the caller's own thread waits until the
-/// device has room. This uses the second, and the first is not available to it — the guest runs
-/// under an emulator whose host boundary is one-way, so there is no thread the device could call
-/// back into.
+/// application every burst, and writes from the caller's own thread. The callback is not available
+/// here — the guest runs under an emulator whose host boundary is one-way, so there is no thread the
+/// device could call back into — so this writes, and <see cref="Submit"/> is what paces the guest,
+/// as the seam specifies: "may block briefly while the device drains its queue (this is what paces
+/// the guest's audio loop)".
 ///
-/// That costs nothing, because blocking is what the seam already specifies: "may block briefly
-/// while the device drains its queue (this is what paces the guest's audio loop)". The device
-/// buffer is sized from <c>SHARPEMU_AUDIO_LATENCY_MS</c> and <c>AAudioStream_write</c> then paces
-/// the guest at that depth with no sleeping loop of ours.
+/// <para><b>The write itself is non-blocking and the waiting is ours.</b> Asking AAudio to block
+/// until the device has room is the obvious reading of that contract, and it is the wrong shape for
+/// a guest thread; see <see cref="WriteTimeoutNanoseconds"/>, which is the important comment in this
+/// file.</para>
 ///
-/// Disconnection — headphones plugged in, Bluetooth connected, a call arriving — is handled by
+/// <para>Disconnection — headphones plugged in, Bluetooth connected, a call arriving — is handled by
 /// reopening underneath rather than by failing the port, so the guest never learns about it. Only
-/// if the reopen fails does <see cref="Submit"/> return false and let the caller pace itself.
+/// if the reopen fails does <see cref="Submit"/> return false and let the caller pace itself. That
+/// path has never executed: nothing was unplugged while it was being tested.</para>
 /// </remarks>
 internal sealed unsafe class AndroidHostAudioStream : IHostAudioStream
 {
@@ -38,15 +40,34 @@ internal sealed unsafe class AndroidHostAudioStream : IHostAudioStream
     private const int UsageGame = 14;
 
     /// <summary>
-    /// How long one <c>AAudioStream_write</c> may park the calling thread.
+    /// How long one <c>AAudioStream_write</c> may park the calling thread: not at all.
     /// </summary>
     /// <remarks>
-    /// Bounded rather than infinite, and this matters more here than it looks. The guest thread
-    /// calling this is a managed thread, and the runtime suspends every thread to collect; one
-    /// parked indefinitely inside a native write is one the collector waits for. A short write is
-    /// a legal AAudio result that the loop below simply retries.
+    /// <para>AAudio will happily block the caller until the device has room, and using that as the
+    /// pacing is the obvious reading of this seam's contract. It is the wrong shape here for a
+    /// reason that has nothing to do with audio: the caller is a <i>guest</i> thread, dispatched
+    /// cooperatively, and a guest thread parked inside a host driver call is a slice that does not
+    /// come back. Whatever else is waiting on that thread waits for the device.</para>
+    /// <para>So the driver is never asked to wait. The write is non-blocking, a full device buffer
+    /// simply returns zero frames accepted, and the pacing is a bounded sleep of ours — which is
+    /// exactly the shape <see cref="Sdl.SdlHostAudio"/> uses and exactly what the silent fallback's
+    /// own pacing does. The device buffer, sized from <c>SHARPEMU_AUDIO_LATENCY_MS</c>, still
+    /// provides the back-pressure; the difference is only in who does the waiting, and a managed
+    /// thread asleep in a one-millisecond loop is interruptible in a way one parked inside a driver
+    /// is not. It costs 5.5x the native calls per second and no measurable CPU.</para>
+    /// <para><b>Do not read this class as the reason playback can stop.</b> A stall that looked like
+    /// an audio bug — the stream still STARTED, nothing returning an error, the audio server
+    /// eventually reporting "writeUpMessageQueue(): Queue full. Did client stop? Suspending stream"
+    /// — was traced to the emulator's cooperative resume path instead, where a blocked thread could
+    /// be sent to a continuation it had already run. Changing who waits here moved that failure's
+    /// rate, because it changed how often the audio thread blocks and is resumed; it was never the
+    /// cause, and the audio server's complaint is a consequence of our last write, not a cause of
+    /// it. The android host layer's audio watchdog reports every occurrence.</para>
     /// </remarks>
-    private const long WriteTimeoutNanoseconds = 20L * 1_000_000L;
+    private const long WriteTimeoutNanoseconds = 0;
+
+    /// <summary>How long to sleep before retrying a device that had no room.</summary>
+    private const int RetrySleepMilliseconds = 1;
 
     /// <summary>
     /// How long <see cref="Submit"/> keeps retrying before giving up on the buffer.
@@ -220,13 +241,23 @@ internal sealed unsafe class AndroidHostAudioStream : IHostAudioStream
                     }
 
                     offset += written;
-                    if (offset < frames && Environment.TickCount64 >= deadline)
+                    if (offset >= frames)
+                    {
+                        break;
+                    }
+
+                    if (Environment.TickCount64 >= deadline)
                     {
                         // A gap is audible and so is an ever-growing delay. Give the rest of this
                         // buffer up and let the caller decide; it still gets a true, because what
                         // was accepted did play.
                         break;
                     }
+
+                    // The device is full, which is the normal case and is where this call's pacing
+                    // comes from. Sleeping here rather than inside the driver is the whole point:
+                    // the thread stays ours, and stays interruptible.
+                    Thread.Sleep(RetrySleepMilliseconds);
                 }
             }
 
