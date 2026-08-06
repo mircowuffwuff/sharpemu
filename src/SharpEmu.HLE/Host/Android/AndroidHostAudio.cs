@@ -21,7 +21,8 @@ namespace SharpEmu.HLE.Host.Android;
 /// a conversion the narrower path would have done never happens.
 ///
 /// Selected by <c>SHARPEMU_HOST_AUDIO=android</c> rather than by a compile-time switch, for the
-/// same reason <see cref="Libs.VideoOut.AndroidHostWindow"/> is: the runtime identifier is still
+/// same reason <c>SharpEmu.Libs.VideoOut.AndroidHostWindow</c> is — it lives in a project this one
+/// does not reference, so it is named rather than linked: the runtime identifier is still
 /// <c>linux-x64</c>, and on a desktop Linux there is no <c>libaaudio.so</c> to P/Invoke, so this
 /// must not be reachable by default.
 /// </remarks>
@@ -36,10 +37,16 @@ internal sealed class AndroidHostAudio : IHostPcmAudioOutput
     /// </summary>
     /// <remarks>
     /// On AAudio this is not a soft cap the backend polices but the device buffer size itself, set
-    /// with <c>AAudioStream_setBufferSizeInFrames</c>. A blocking write then paces the guest at
-    /// exactly that depth without any sleeping loop of ours, which is what the seam's contract —
-    /// "may block briefly while the device drains its queue (this is what paces the guest's audio
-    /// loop)" — describes.
+    /// with <c>AAudioStream_setBufferSizeInFrames</c>. That depth is what paces the guest, and it
+    /// is what the seam's contract — "may block briefly while the device drains its queue (this is
+    /// what paces the guest's audio loop)" — describes.
+    ///
+    /// <para><b>The waiting is ours, not the driver's.</b> Asking AAudio to block until the device has
+    /// room is the obvious way to get that pacing and is the wrong shape for a guest thread, so
+    /// <see cref="AndroidHostAudioStream"/> writes with a zero timeout and sleeps in a
+    /// one-millisecond retry loop instead. The back-pressure is the same either way — this buffer
+    /// size provides it — and only who does the waiting differs. See
+    /// <c>AndroidHostAudioStream.WriteTimeoutNanoseconds</c> before changing that back.</para>
     /// </remarks>
     internal static int TargetLatencyMilliseconds =>
         int.TryParse(
