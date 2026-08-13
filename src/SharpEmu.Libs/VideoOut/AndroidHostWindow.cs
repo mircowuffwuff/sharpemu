@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Runtime.InteropServices;
+using SharpEmu.HLE.Host;
+using SharpEmu.HLE.Host.Android;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.VideoOut;
@@ -48,12 +50,35 @@ internal sealed unsafe class AndroidHostWindow : IHostWindow
     private int _closeRequested;
     private bool _disposed;
 
+    /// <summary>
+    /// The pad, registered for as long as this window exists, or null where the host does not offer
+    /// one.
+    /// </summary>
+    /// <remarks>
+    /// The window owns this because the input seam is the window layer's to fill: on Linux
+    /// <see cref="SdlHostWindow"/> connects SDL's, and the pad exports reach whichever is registered
+    /// through <see cref="HostWindowInputSource"/> without knowing which platform answered. Android
+    /// has no window to pump events from and no readable input device, so what stands in is a poll of
+    /// the host — see <see cref="AndroidHostInput"/>.
+    /// </remarks>
+    private readonly AndroidHostInput? _input;
+
     public AndroidHostWindow(string title, HostVideoOptions options)
     {
         _options = ApplyHostSize(options).Normalize();
+        // registered before anything renders, because a guest that reaches its pad initialisation
+        // before its first frame — which several do — would otherwise find no source and cache the
+        // absence.
+        if (AndroidHostInput.IsSelected())
+        {
+            _input = new AndroidHostInput();
+            HostWindowInputSource.Set(_input);
+        }
+
         Console.Error.WriteLine(
             $"[LOADER][INFO] Android host window ready (headless surface): " +
-            $"size={_options.Width}x{_options.Height} title=\"{title}\"");
+            $"size={_options.Width}x{_options.Height} title=\"{title}\" " +
+            $"pad={(_input is null ? "none" : "host")}");
     }
 
     public static bool IsSelected() =>
@@ -202,6 +227,12 @@ internal sealed unsafe class AndroidHostWindow : IHostWindow
         }
 
         _disposed = true;
+        if (_input is not null)
+        {
+            // Clear compares before it clears, so a source registered after this one is left alone.
+            HostWindowInputSource.Clear(_input);
+        }
+
         if (_extensionArray != 0)
         {
             Marshal.FreeHGlobal(_extensionArray);
