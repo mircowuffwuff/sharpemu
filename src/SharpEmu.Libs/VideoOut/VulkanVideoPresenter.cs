@@ -6,6 +6,7 @@ using Silk.NET.Core.Native;
 using System.Collections.Concurrent;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.AvPlayer;
 using SharpEmu.Libs.Media;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.ShaderCompiler;
@@ -525,6 +526,9 @@ internal static unsafe class VulkanVideoPresenter
     // render thread reaches the previous image, which otherwise starves
     // presentation indefinitely.
     private static readonly Queue<Presentation> _pendingGuestImagePresentations = new();
+    // Same fix as _pendingGuestImagePresentations above, for Submit()'s decoded video
+    // frames: a single "latest wins" slot dropped frames the render loop didn't poll in time.
+    private static readonly Queue<Presentation> _pendingVideoPresentations = new();
     private static readonly Dictionary<ulong, long> _guestImageWorkSequences = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     // Write-tracker generation last uploaded for a CPU-backed guest image.
@@ -804,6 +808,7 @@ internal static unsafe class VulkanVideoPresenter
         _pendingSyncGuestWorkCount = 0;
         _pendingGuestWorkBytes = 0;
         _pendingGuestImagePresentations.Clear();
+        _pendingVideoPresentations.Clear();
         _guestImageWorkSequences.Clear();
         _availableGuestImages.Clear();
         _cpuBackedUploadGenerations.Clear();
@@ -859,7 +864,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(
+            var presentation = new Presentation(
                 bgraFrame,
                 width,
                 height,
@@ -868,6 +873,15 @@ internal static unsafe class VulkanVideoPresenter
                 TranslatedDraw: null,
                 RequiredGuestWorkSequence: 0,
                 IsSplash: false);
+
+            // Also dual-written to _latestPresentation as a fallback once the queue drains.
+            _pendingVideoPresentations.Enqueue(presentation);
+            while (_pendingVideoPresentations.Count > MaxPendingGuestFlipVersions)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            _latestPresentation = presentation;
             if (_thread is not null)
             {
                 return;
@@ -2426,11 +2440,25 @@ internal static unsafe class VulkanVideoPresenter
                 if (IsGuestWorkCompletedLocked(pending.RequiredGuestWorkSequence))
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
+                    TryReplaceWithHostMovieFrame(ref presentation);
                     return true;
                 }
 
                 presentation = default;
                 return false;
+            }
+
+            // Video's RequiredGuestWorkSequence is always 0, so this never blocks like the guest-image queue can.
+            while (_pendingVideoPresentations.Count > 0 &&
+                   _pendingVideoPresentations.Peek().Sequence <= presentedSequence)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            if (_pendingVideoPresentations.Count > 0)
+            {
+                presentation = _pendingVideoPresentations.Dequeue();
+                return true;
             }
 
             if (_latestPresentation is not { } latest ||
@@ -2458,10 +2486,97 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             presentation = latest;
+            TryReplaceWithHostMovieFrame(ref presentation);
             return true;
         }
     }
 
+    /// <summary>
+    /// AvPlayer titles whose guest texture allocators reject the decoded movie
+    /// surface have no sampled image to draw, so the movie would never become
+    /// visible.  In that case the AvPlayer HLE keeps a host-decoded BGRA frame
+    /// available; substitute it for the guest image the title is flipping.
+    /// </summary>
+    private static void TryReplaceWithHostMovieFrame(ref Presentation presentation)
+    {
+        if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
+        {
+            return;
+        }
+
+        presentation = new Presentation(
+            pixels,
+            width,
+            height,
+            presentation.Sequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            presentation.RequiredGuestWorkSequence,
+            IsSplash: false);
+    }
+
+    /// <summary>
+    /// The movie is decoded on the host clock, so it must not be limited to the
+    /// title's flip rate: emulated flips are far slower than 59.94 Hz, which
+    /// would turn the intro into a slideshow.  The render loop uses this on the
+    /// ticks where the guest produced no new flip, keeping the same presented
+    /// sequence so guest presentation bookkeeping is untouched.
+    /// </summary>
+    private static bool TryTakeHostMovieOnlyPresentation(
+        long presentedSequence,
+        out Presentation presentation)
+    {
+        if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
+        {
+            presentation = default;
+            return false;
+        }
+
+        presentation = new Presentation(
+            pixels,
+            width,
+            height,
+            presentedSequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            RequiredGuestWorkSequence: 0,
+            IsSplash: false);
+        return true;
+    }
+
+    private static bool TryTakeHostMovieFrame(
+        out byte[] pixels,
+        out uint width,
+        out uint height)
+    {
+        if (!AvPlayerExports.TryGetFallbackPresentationFrame(
+                out pixels,
+                out width,
+                out height,
+                out var serial))
+        {
+            return false;
+        }
+
+        if (Interlocked.Exchange(
+                ref _tracedAvPlayerFallbackPresentationSerial,
+                serial) != serial)
+        {
+            var frameCount = Interlocked.Increment(
+                ref _avPlayerFallbackPresentationCount);
+            if (frameCount <= 4 || frameCount % 30 == 0)
+            {
+                Console.Error.WriteLine(
+                    "[VIDEOOUT][INFO] AvPlayer host fallback frame presented: " +
+                    $"frame={frameCount} serial={serial} size={width}x{height}.");
+            }
+        }
+
+        return true;
+    }
+
+    private static long _tracedAvPlayerFallbackPresentationSerial;
+    private static long _avPlayerFallbackPresentationCount;
     private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
 
 	private static bool HasPendingGuestPresentation(long presentedSequence)
@@ -15637,6 +15752,12 @@ internal static unsafe class VulkanVideoPresenter
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.TakePresentation))
             {
                 tookPresentation = TryTakePresentation(_presentedSequence, out presentation);
+            }
+
+            if (!tookPresentation &&
+                TryTakeHostMovieOnlyPresentation(_presentedSequence, out presentation))
+            {
+                tookPresentation = true;
             }
 
             if (!tookPresentation)

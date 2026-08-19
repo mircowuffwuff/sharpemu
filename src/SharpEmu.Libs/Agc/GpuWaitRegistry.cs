@@ -60,6 +60,17 @@ internal static class GpuWaitRegistry
     // address) so distinct guest processes never alias.
     private static readonly Dictionary<(object, ulong), ulong> _lastProduced = new();
 
+  
+    private static object? Canonicalize(object? memory)
+    {
+        while (memory is SharpEmu.HLE.ICpuMemoryWrapper wrapper)
+        {
+            memory = wrapper.Inner;
+        }
+
+        return memory;
+    }
+
     public static int Count
     {
         get
@@ -79,6 +90,7 @@ internal static class GpuWaitRegistry
 
     public static int CountForMemory(object memory)
     {
+        memory = Canonicalize(memory)!;
         lock (_gate)
         {
             var total = 0;
@@ -106,6 +118,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static OutstandingSnapshot SnapshotOutstanding(object? memory = null)
     {
+        memory = Canonicalize(memory);
         lock (_gate)
         {
             var outstanding = 0;
@@ -155,6 +168,7 @@ internal static class GpuWaitRegistry
     public static void Register(ulong address, WaitingDcb waiter)
     {
         waiter.WaitAddress = address;
+        waiter.Memory = Canonicalize(waiter.Memory);
         lock (_gate)
         {
             if (!_waiters.TryGetValue(address, out var list))
@@ -177,6 +191,7 @@ internal static class GpuWaitRegistry
         object memory,
         Func<ulong, bool, ulong?> readValue)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? woken = null;
         lock (_gate)
         {
@@ -237,6 +252,7 @@ internal static class GpuWaitRegistry
         long nowTicks,
         long maxAgeTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? stale = null;
         lock (_gate)
         {
@@ -273,6 +289,7 @@ internal static class GpuWaitRegistry
         ulong start,
         ulong length)
     {
+        memory = Canonicalize(memory)!;
         var matches = new List<(ulong Address, int Count)>();
         if (length == 0)
         {
@@ -328,6 +345,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static bool LatchSatisfiedByValue(object memory, ulong address, ulong value)
     {
+        memory = Canonicalize(memory)!;
         var latchedAny = false;
         lock (_gate)
         {
@@ -356,6 +374,56 @@ internal static class GpuWaitRegistry
     }
 
     /// <summary>
+    /// Every registered waiter, for the flip-stall watchdog. Not filtered by
+    /// memory identity — the watchdog wants a whole-process view.
+    /// </summary>
+    public static List<WaitingDcb> SnapshotAll()
+    {
+        var snapshot = new List<WaitingDcb>();
+        lock (_gate)
+        {
+            foreach (var (_, list) in _waiters)
+            {
+                snapshot.AddRange(list);
+            }
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Removes the waiter at <paramref name="address"/> whose State is
+    /// <paramref name="state"/> — used when a new submission supersedes a
+    /// ring-tail park that would otherwise pin the queue forever.
+    /// </summary>
+    public static bool TryRemoveByState(object state, ulong address)
+    {
+        lock (_gate)
+        {
+            if (!_waiters.TryGetValue(address, out var list))
+            {
+                return false;
+            }
+
+            for (var i = list.Count - 1; i >= 0; i--)
+            {
+                if (ReferenceEquals(list[i].State, state))
+                {
+                    list.RemoveAt(i);
+                    if (list.Count == 0)
+                    {
+                        _waiters.Remove(address);
+                    }
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Removes and returns waiters carrying a <see cref="WaitingDcb.RetryDeadlineTicks"/>
     /// that has elapsed. Used for indirect-dispatch dimension retries: the caller
     /// resumes them so a genuinely empty dispatch (dims that never become non-zero)
@@ -363,6 +431,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static List<WaitingDcb>? CollectExpiredRetries(object memory, long nowTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? expired = null;
         lock (_gate)
         {
@@ -405,6 +474,7 @@ internal static class GpuWaitRegistry
 
     public static List<WaitingDcb>? CollectAllForMemory(object memory)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? collected = null;
         lock (_gate)
         {
@@ -490,6 +560,7 @@ internal static class GpuWaitRegistry
     /// breaker. Also latches any already-waiting waiter it satisfies.</summary>
     public static bool RecordProduced(object memory, ulong address, ulong value)
     {
+        memory = Canonicalize(memory)!;
         lock (_gate)
         {
             if (_lastProduced.Count >= 8192)
@@ -523,6 +594,7 @@ internal static class GpuWaitRegistry
         long nowTicks,
         long minAgeTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? broken = null;
         lock (_gate)
         {
@@ -564,6 +636,21 @@ internal static class GpuWaitRegistry
         return broken;
     }
 
+    // Under orphan force-submit, producers can run ahead of waiter
+    // registration and pass an equal-compare value before it's ever seen.
+    // Treat == as "reached or passed" only in that mode, so other titles
+    // keep exact hardware semantics. SHARPEMU_GPU_WAIT_EQ_EXACT=1 restores
+    // strict equality for A/B.
+    private static readonly bool _equalCompareExact =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_EQ_EXACT"),
+            "1",
+            StringComparison.Ordinal) ||
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES"),
+            "1",
+            StringComparison.Ordinal);
+
     public static bool Compare(in WaitingDcb waiter, ulong value)
     {
         var masked = value & waiter.Mask;
@@ -573,7 +660,7 @@ internal static class GpuWaitRegistry
             0 => true,
             1 => masked < reference,
             2 => masked <= reference,
-            3 => masked == reference,
+            3 => _equalCompareExact ? masked == reference : masked >= reference,
             4 => masked != reference,
             5 => masked >= reference,
             6 => masked > reference,
