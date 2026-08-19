@@ -122,6 +122,8 @@ public static class VideoOutExports
                 : titleId.Trim();
             _applicationWindowTitle = $"{application}{versionSuffix}";
         }
+
+        RenderDocCapture.SetCaptureDirectory(GetApplicationTitleId());
     }
 
     internal static string GetApplicationTitleId()
