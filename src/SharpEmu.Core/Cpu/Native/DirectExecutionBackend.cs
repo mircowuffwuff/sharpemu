@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Iced.Intel;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Loader;
@@ -1641,16 +1642,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		if (_moduleManager.TryGetExport(nid, out ExportedFunction export))
 		{
-			if (IsKernelLibrary(export.LibraryName))
+			var preferLleForLibc = IsLibcLibrary(export.LibraryName) && PreferLleForLibcExport(export.Name);
+			if (!ShouldResolveRegisteredExportViaLle(export, preferLleForLibc))
 			{
-				if (_logAllImports)
+				if (_logAllImports && IsKernelLibrary(export.LibraryName))
 				{
 					Console.Error.WriteLine($"[LOADER][DEBUG] TryResolveDirectImportTarget: {nid} ({export.LibraryName}:{export.Name}) -> HLE (kernel library)");
 				}
-				return false;
-			}
-			if (!IsLibcLibrary(export.LibraryName) || !PreferLleForLibcExport(export.Name))
-			{
 				return false;
 			}
 			if (TryResolveRuntimeSymbolAddress(nid, out var value2) && IsDirectImportTargetUsable(value2))
@@ -1704,6 +1702,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		return false;
+	}
+
+	internal static bool ShouldResolveRegisteredExportViaLle(
+		ExportedFunction export,
+		bool preferLleForLibc)
+	{
+		ArgumentNullException.ThrowIfNull(export);
+		return !IsKernelLibrary(export.LibraryName) && (export.PreferLle || preferLleForLibc);
 	}
 
 	private static bool IsHlePreferredNid(string nid)
@@ -3203,7 +3209,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					nint address = (nint)(ptr + i);
 					int remainingBytes = scanBytes - i;
-					if (TryPatchTlsLoadInstruction(address, ptr + i, remainingBytes))
+					if (TryPatchTlsLoadInstruction(address, ptr + i, remainingBytes, i))
 					{
 						num3++;
 					}
@@ -3346,9 +3352,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
-	private unsafe bool TryPatchTlsLoadInstruction(nint address, byte* source, int availableLength)
+	private unsafe bool TryPatchTlsLoadInstruction(nint address, byte* source, int availableLength, int regionOffset)
 	{
 		if (availableLength < MinTlsPatchInstructionBytes)
+		{
+			return false;
+		}
+
+		var region = new ReadOnlySpan<byte>(source - regionOffset, regionOffset + availableLength);
+		if (IsTlsLoadCandidateInsideShortJump(region, regionOffset))
 		{
 			return false;
 		}
@@ -3403,6 +3415,76 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		return PatchTlsLoadInstruction(address, instructionLength, destinationRegister);
+	}
+
+	internal static bool IsTlsLoadCandidateInsideShortJump(ReadOnlySpan<byte> region, int candidateOffset)
+	{
+		if ((uint)candidateOffset >= (uint)region.Length ||
+			candidateOffset < 1 ||
+			region[candidateOffset - 1] != 0xEB)
+		{
+			return false;
+		}
+
+		// Accept EB when it is an aligned rel8 operand.
+		if (IsRel8ControlFlowInstructionEndingAtCandidate(region, candidateOffset))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	private static bool IsRel8ControlFlowInstructionEndingAtCandidate(
+		ReadOnlySpan<byte> region,
+		int candidateOffset)
+	{
+		if (candidateOffset < 2)
+		{
+			return false;
+		}
+
+		var branchOffset = candidateOffset - 2;
+		var opcode = region[branchOffset];
+		if (!((opcode >= 0x70 && opcode <= 0x7F) ||
+			opcode is >= 0xE0 and <= 0xE3 ||
+			opcode == 0xEB))
+		{
+			return false;
+		}
+
+		var branchTarget = candidateOffset + (sbyte)region[candidateOffset - 1];
+		if (branchTarget < 0 || branchTarget >= branchOffset)
+		{
+			return false;
+		}
+
+		// Require an aligned instruction stream.
+		var decoder = Decoder.Create(
+			64,
+			new ByteArrayCodeReader(region[branchTarget..candidateOffset].ToArray()));
+		decoder.IP = (ulong)branchTarget;
+		while (decoder.IP < (ulong)candidateOffset)
+		{
+			var instructionOffset = (int)decoder.IP;
+			decoder.Decode(out var instruction);
+			if (instruction.Code == Code.INVALID || instruction.Length <= 0)
+			{
+				return false;
+			}
+
+			if (instructionOffset == branchOffset)
+			{
+				return instruction.Length == 2 && decoder.IP == (ulong)candidateOffset;
+			}
+
+			if (decoder.IP > (ulong)branchOffset)
+			{
+				return false;
+			}
+		}
+
+		return false;
 	}
 
 	private unsafe bool PatchTlsLoadInstruction(nint address, int instructionLength, int destinationRegister)

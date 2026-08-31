@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
@@ -18,7 +19,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private readonly object _allocationSearchHintGate = new();
     private readonly List<MemoryRegion> _regions = new();
     private readonly Dictionary<(ulong DesiredAddress, ulong Alignment, bool Executable), ulong> _allocationSearchHints = new();
-    private readonly Dictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
+    private readonly ConcurrentDictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
     private bool _disposed;
 
     [ThreadStatic]
@@ -28,7 +29,13 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private const ulong PageSize = 0x1000;
     private const ulong HostAllocationGranularity = 0x10000;
     private static readonly ulong GuestAllocationArenaAddress = HostAddressSpace.GuestAllocationArenaAddress;
-    private const ulong GuestAllocationArenaSize = 0x0100_0000;
+    // Full C++ runtimes can route large numbers of HLE-backed heap allocations
+    // through this arena. The original 16 MiB capacity could be exhausted
+    // during asset setup, turning a valid allocation request into a null
+    // pointer that failed later in unrelated guest code. Keep enough capacity
+    // for those workloads. Adapted from foufouadi's allocator-exhaustion
+    // investigation.
+    private const ulong GuestAllocationArenaSize = 0x2000_0000;
     private const ulong GuestAllocationArenaStartOffset = PageSize;
     private const ulong LargeDataReserveThreshold = 0x4000_0000UL; // 1 GiB
     private const ulong FullCommitRegionLimit = 4UL << 30;
