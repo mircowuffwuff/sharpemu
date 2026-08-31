@@ -3,7 +3,10 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.Libs.Media;
+using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -15,15 +18,219 @@ public static class AvPlayerExports
     private const int InvalidParameters = unchecked((int)0x806A0001);
     private const int OperationFailed = unchecked((int)0x806A0002);
     private const int FrameBufferCount = 3;
+    private const int MaxCatchUpFrames = 2;
+    private const ulong TextureAllocationAlignment = 0x100;
+    private const int FramePitchAlignment = 64;
+    private const int FrameHeightAlignment = 16;
     private const int FrameInfoSize = 40;
     private const int FrameInfoExSize = 104;
-    // This structure is 32 bytes. A larger write can damage the guest stack.
-    private const int StreamInfoSize = 32;
-    private const int StreamInfoExSize = 32;
+    // The legacy destination is 40 bytes on Gen4 but only 32 bytes on Gen5.
+    // Writing the Gen4 layout into a Gen5 caller can overwrite its stack canary.
+    private const int Gen4StreamInfoSize = 40;
+    private const int Gen5StreamInfoSize = 32;
+    private const int StreamInfoExSize = 104;
     private const int MaxGuestPathLength = 4096;
+    private const int VideoPitchAlignment = 256;
     private static readonly object StateGate = new();
+    private static readonly HashSet<string> TracedOnce = new();
     private static readonly Dictionary<ulong, PlayerState> Players = new();
+    private static readonly ConcurrentDictionary<ulong, ulong> VideoBufferRanges = new();
+    private static readonly bool TraceVideoImages = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AVPLAYER_IMAGES"),
+        "1",
+        StringComparison.Ordinal);
     private static int _traceCount;
+    private static int _videoPayloadTraceCount;
+    private static long _fallbackPresentationSerial;
+
+    internal static bool TryGetFallbackPresentationFrame(
+        out byte[] pixels,
+        out uint width,
+        out uint height,
+        out long serial)
+    {
+        lock (StateGate)
+        {
+            PlayerState? latest = null;
+            foreach (var player in Players.Values)
+            {
+                if (player.FallbackPlayback is { } playback)
+                {
+                    if (playback.TryGetFrame(
+                            advanceClock: true,
+                            out var playbackPixels,
+                            out var advanced))
+                    {
+                        var skipFirstDecodedFrame =
+                            player.SkipFirstFallbackPlaybackFrame;
+                        if (ShouldPublishFallbackPlaybackFrame(
+                                advanced,
+                                player.FallbackPresentationPixels is not null,
+                                ref skipFirstDecodedFrame))
+                        {
+                            player.FallbackPresentationPixels = playbackPixels;
+                            player.FallbackPresentationWidth = playback.Width;
+                            player.FallbackPresentationHeight = playback.Height;
+                            player.FallbackPresentationSerial =
+                                Interlocked.Increment(ref _fallbackPresentationSerial);
+                        }
+                        player.SkipFirstFallbackPlaybackFrame =
+                            skipFirstDecodedFrame;
+                    }
+                    else if (playback.IsFinished)
+                    {
+                        playback.Dispose();
+                        player.FallbackPlayback = null;
+                        player.FallbackPlaybackCompleted = true;
+                        player.FallbackPlaybackCompletedTicks = Stopwatch.GetTimestamp();
+                        Trace(
+                            $"host_fallback_finished handle=0x{player.Handle:X16} " +
+                            "holding_last_frame=true");
+                    }
+                }
+
+                // The host decoder can finish long before a heavily throttled
+                // guest AvPlayer reaches EOF.  Keep its final image over the
+                // stale guest texture until the guest has actually consumed
+                // the stream; otherwise frame zero becomes visible again and
+                // the intro appears to start a second time.  The hold is
+                // bounded: a title that pauses its player after the poster
+                // frame never reaches EOF, and an unbounded hold would pin the
+                // final movie image over everything the game renders next.
+                if (ShouldReleaseCompletedFallback(
+                        player.FallbackPlaybackCompleted,
+                        player.EndOfStream,
+                        player.FallbackPlaybackCompletedTicks,
+                        Stopwatch.GetTimestamp()))
+                {
+                    ClearFallbackPresentation(player);
+                }
+
+                if (player.FallbackPresentationPixels is null ||
+                    player.FallbackPresentationSerial <= 0 ||
+                    latest is not null &&
+                    player.FallbackPresentationSerial <= latest.FallbackPresentationSerial)
+                {
+                    continue;
+                }
+
+                latest = player;
+            }
+
+            if (latest?.FallbackPresentationPixels is not { } frame)
+            {
+                pixels = [];
+                width = 0;
+                height = 0;
+                serial = 0;
+                return false;
+            }
+
+            pixels = frame;
+            width = latest.FallbackPresentationWidth;
+            height = latest.FallbackPresentationHeight;
+            serial = latest.FallbackPresentationSerial;
+            return IsValidBgraFrame(pixels, width, height);
+        }
+    }
+
+    internal static bool ShouldPublishFallbackPlaybackFrame(
+        bool advanced,
+        bool hasPresentation,
+        ref bool skipFirstDecodedFrame)
+    {
+        if (advanced && hasPresentation && skipFirstDecodedFrame)
+        {
+            skipFirstDecodedFrame = false;
+            return false;
+        }
+
+        return advanced || !hasPresentation;
+    }
+
+    /// <summary>
+    /// How long a finished host playback keeps its final image on screen while
+    /// waiting for the guest player to reach end of stream.  Titles that pause
+    /// their AvPlayer after the first frame never do, so the hold expires.
+    /// </summary>
+    private static readonly long FallbackHoldGraceTicks = Stopwatch.Frequency;
+
+    internal static bool ShouldReleaseCompletedFallback(
+        bool fallbackPlaybackCompleted,
+        bool guestEndOfStream,
+        long completedTicks,
+        long nowTicks) =>
+        fallbackPlaybackCompleted &&
+        (guestEndOfStream ||
+         completedTicks != 0 && nowTicks - completedTicks >= FallbackHoldGraceTicks);
+
+    private static void ClearFallbackPresentation(PlayerState player)
+    {
+        player.FallbackPresentationPixels = null;
+        player.FallbackPresentationWidth = 0;
+        player.FallbackPresentationHeight = 0;
+        player.FallbackPresentationSerial = 0;
+        player.FallbackPlaybackCompleted = false;
+        player.FallbackPlaybackCompletedTicks = 0;
+        player.SkipFirstFallbackPlaybackFrame = false;
+        Trace(
+            $"host_fallback_released handle=0x{player.Handle:X16} " +
+            $"guest_eof={player.EndOfStream}");
+    }
+
+    internal static bool ShouldTraceVideoBufferAddress(ulong address)
+    {
+        if (!TraceVideoImages || address == 0)
+        {
+            return false;
+        }
+
+        foreach (var (start, length) in VideoBufferRanges)
+        {
+            if (address >= start && address - start < length)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool ShouldTraceVideoBufferRange(ulong address, ulong length)
+    {
+        if (!TraceVideoImages || address == 0 || length == 0)
+        {
+            return false;
+        }
+
+        foreach (var (start, rangeLength) in VideoBufferRanges)
+        {
+            if (address <= start
+                    ? start - address < length
+                    : address - start < rangeLength)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void RegisterVideoBuffer(ulong address, int size, int index, string source)
+    {
+        if (address == 0 || size <= 0)
+        {
+            return;
+        }
+
+        VideoBufferRanges[address] = checked((ulong)size);
+        if (TraceVideoImages)
+        {
+            Console.Error.WriteLine(
+                $"[AVPLAYER][TRACE] video_buffer index={index} source={source} " +
+                $"data=0x{address:X16} size={size}");
+        }
+    }
 
     private sealed class PlayerState : IDisposable
     {
@@ -31,6 +238,7 @@ public static class AvPlayerExports
         public bool AutoStart { get; init; }
         public ulong AllocatorObject { get; init; }
         public ulong AllocateTextureCallback { get; init; }
+        public ulong AllocateCallback { get; init; }
         public ulong EventObject { get; init; }
         public ulong EventCallback { get; init; }
         public string? SourcePath { get; set; }
@@ -38,15 +246,16 @@ public static class AvPlayerExports
         public int Height { get; set; }
         public double FramesPerSecond { get; set; } = 30.0;
         public ulong DurationMilliseconds { get; set; }
+        public bool HasAudio { get; set; }
+        public bool IsGen5 { get; init; }
         public bool Started { get; set; }
         public bool Paused { get; set; }
         public bool Looping { get; set; }
         public bool EndOfStream { get; set; }
-        public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
-        public Process? AudioDecoder { get; set; }
         public Stream? AudioDecoderOutput { get; set; }
         public Stopwatch PlaybackClock { get; } = new();
+        public long SkippedFrameDebt { get; set; }
         public byte[]? RawFrame { get; set; }
         public byte[]? RawAudioFrame { get; set; }
         public byte[]? PaddedFrame { get; set; }
@@ -55,10 +264,20 @@ public static class AvPlayerExports
         public int GuestBufferStride { get; set; }
         public int NextGuestBuffer { get; set; }
         public ulong LastGuestBuffer { get; set; }
+        public ulong LastVideoTimestamp { get; set; }
         public long NextFrameIndex { get; set; }
         public ulong AudioBufferBase { get; set; }
         public int NextAudioBuffer { get; set; }
         public long NextAudioFrameIndex { get; set; }
+        public byte[]? FallbackPresentationPixels { get; set; }
+        public uint FallbackPresentationWidth { get; set; }
+        public uint FallbackPresentationHeight { get; set; }
+        public long FallbackPresentationSerial { get; set; }
+        public MediaFramePlayback? FallbackPlayback { get; set; }
+        public bool FallbackPlaybackAttempted { get; set; }
+        public bool FallbackPlaybackCompleted { get; set; }
+        public long FallbackPlaybackCompletedTicks { get; set; }
+        public bool SkipFirstFallbackPlaybackFrame { get; set; }
 
         public void Dispose()
         {
@@ -66,42 +285,8 @@ public static class AvPlayerExports
             DecoderOutput = null;
             AudioDecoderOutput?.Dispose();
             AudioDecoderOutput = null;
-            if (Decoder is not null)
-            {
-                try
-                {
-                    if (!Decoder.HasExited)
-                    {
-                        Decoder.Kill(entireProcessTree: true);
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                }
-                finally
-                {
-                    Decoder.Dispose();
-                    Decoder = null;
-                }
-            }
-            if (AudioDecoder is not null)
-            {
-                try
-                {
-                    if (!AudioDecoder.HasExited)
-                    {
-                        AudioDecoder.Kill(entireProcessTree: true);
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                }
-                finally
-                {
-                    AudioDecoder.Dispose();
-                    AudioDecoder = null;
-                }
-            }
+            FallbackPlayback?.Dispose();
+            FallbackPlayback = null;
         }
 
         public void ResetPlayback()
@@ -109,8 +294,19 @@ public static class AvPlayerExports
             Dispose();
             PlaybackClock.Reset();
             NextFrameIndex = 0;
+            LastGuestBuffer = 0;
+            LastVideoTimestamp = 0;
             NextAudioFrameIndex = 0;
+            SkippedFrameDebt = 0;
             EndOfStream = false;
+            FallbackPresentationPixels = null;
+            FallbackPresentationWidth = 0;
+            FallbackPresentationHeight = 0;
+            FallbackPresentationSerial = 0;
+            FallbackPlaybackAttempted = false;
+            FallbackPlaybackCompleted = false;
+            FallbackPlaybackCompletedTicks = 0;
+            SkipFirstFallbackPlaybackFrame = false;
         }
     }
 
@@ -131,12 +327,15 @@ public static class AvPlayerExports
 
         lock (StateGate)
         {
+            var autoStartOffset = GetAutoStartOffset(ctx.TargetGeneration, extended: false);
             Players.Add(handle, new PlayerState
             {
                 Handle = handle,
-                AutoStart = TryReadByte(ctx, initDataAddress + 108, out var autoStart) && autoStart != 0,
+                IsGen5 = IsGen5Target(ctx.TargetGeneration),
+                AutoStart = TryReadByte(ctx, initDataAddress + autoStartOffset, out var autoStart) && autoStart != 0,
                 AllocatorObject = TryReadUInt64(ctx, initDataAddress, out var allocatorObject) ? allocatorObject : 0,
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 24, out var allocateTexture) ? allocateTexture : 0,
+                AllocateCallback = TryReadUInt64(ctx, initDataAddress + 8, out var allocate) ? allocate : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 80, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 88, out var eventCallback) ? eventCallback : 0,
             });
@@ -185,12 +384,15 @@ public static class AvPlayerExports
 
         lock (StateGate)
         {
+            var autoStartOffset = GetAutoStartOffset(ctx.TargetGeneration, extended: true);
             Players.Add(handle, new PlayerState
             {
                 Handle = handle,
-                AutoStart = TryReadByte(ctx, initDataAddress + 164, out var autoStart) && autoStart != 0,
+                IsGen5 = IsGen5Target(ctx.TargetGeneration),
+                AutoStart = TryReadByte(ctx, initDataAddress + autoStartOffset, out var autoStart) && autoStart != 0,
                 AllocatorObject = TryReadUInt64(ctx, initDataAddress + 8, out var allocatorObject) ? allocatorObject : 0,
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 32, out var allocateTexture) ? allocateTexture : 0,
+                AllocateCallback = TryReadUInt64(ctx, initDataAddress + 16, out var allocate) ? allocate : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 88, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 96, out var eventCallback) ? eventCallback : 0,
             });
@@ -348,20 +550,24 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerResume(CpuContext ctx)
     {
+        PlayerState player;
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var foundPlayer))
             {
                 return SetReturn(ctx, InvalidParameters);
             }
+            player = foundPlayer;
 
             player.Paused = false;
-            if (player.Decoder is not null)
+            if (player.DecoderOutput is not null)
             {
                 player.PlaybackClock.Start();
             }
-            return SetReturn(ctx, 0);
         }
+
+        NotifyEvent(ctx, player, 3); // StatePlay
+        return SetReturn(ctx, 0);
     }
 
     [SysAbiExport(
@@ -388,7 +594,13 @@ public static class AvPlayerExports
         ExportName = "sceAvPlayerEnableStream",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
-    public static int AvPlayerEnableStream(CpuContext ctx) => ValidatePlayer(ctx);
+    public static int AvPlayerEnableStream(CpuContext ctx)
+    {
+        TraceOnce(
+            $"enable_stream_{ctx[CpuRegister.Rsi]}",
+            $"enable_stream index={ctx[CpuRegister.Rsi]}");
+        return ValidatePlayer(ctx);
+    }
 
     [SysAbiExport(
         Nid = "k-q+xOxdc3E",
@@ -406,8 +618,33 @@ public static class AvPlayerExports
         ExportName = "sceAvPlayerGetStreamInfoEx",
         Target = Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
-    public static int AvPlayerGetStreamInfoEx(CpuContext ctx) =>
-        GetStreamInfoCore(ctx, StreamInfoExSize);
+    public static int AvPlayerGetStreamInfoEx(CpuContext ctx)
+    {
+        var streamIndex = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var infoAddress = ctx[CpuRegister.Rdx];
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
+                streamIndex > (player.HasAudio ? 1u : 0u) ||
+                infoAddress == 0)
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            Span<byte> info = stackalloc byte[StreamInfoExSize];
+            info.Clear();
+            WriteGen5StreamInfoEx(
+                info,
+                GetStreamType(ctx.TargetGeneration, streamIndex),
+                streamIndex == 0 ? checked((uint)player.Width) : 0,
+                streamIndex == 0 ? checked((uint)player.Height) : 0,
+                streamIndex == 0 ? player.FramesPerSecond : 0,
+                player.DurationMilliseconds);
+            return SetReturn(
+                ctx,
+                ctx.Memory.TryWrite(infoAddress, info) ? 0 : InvalidParameters);
+        }
+    }
 
     [SysAbiExport(
         Nid = "XC9wM+xULz8",
@@ -445,10 +682,13 @@ public static class AvPlayerExports
     {
         lock (StateGate)
         {
-            return SetReturn(
-                ctx,
-                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
-                player.Started && !player.EndOfStream ? 1 : 0);
+            var found = Players.TryGetValue(ctx[CpuRegister.Rdi], out var player);
+            var active = found && player!.Started && !player.EndOfStream;
+            TraceOnce(
+                "is_active",
+                $"is_active found={found} started={(found && player!.Started)} " +
+                $"eos={(found && player!.EndOfStream)} returned={(active ? 1 : 0)}");
+            return SetReturn(ctx, active ? 1 : 0);
         }
     }
 
@@ -476,12 +716,21 @@ public static class AvPlayerExports
         var infoAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
-                player.SourcePath is null || !EnsureAudioDecoder(player))
+            var found = Players.TryGetValue(ctx[CpuRegister.Rdi], out var player);
+            if (!found || infoAddress == 0 || !player!.Started || player.Paused ||
+                player.EndOfStream || player.SourcePath is null ||
+                !player.HasAudio || !EnsureAudioDecoder(player))
             {
+                TraceOnce(
+                    "audio_data_refused",
+                    $"audio_data refused found={found} info=0x{infoAddress:X16} " +
+                    $"started={(found && player!.Started)} paused={(found && player!.Paused)} " +
+                    $"eos={(found && player!.EndOfStream)} " +
+                    $"has_audio={(found && player!.HasAudio)}");
                 return SetReturn(ctx, 0);
             }
+
+            TraceOnce("audio_data_ok", "audio_data first delivery");
 
             const int samplesPerFrame = 1024;
             const int channelCount = 2;
@@ -560,7 +809,11 @@ public static class AvPlayerExports
     {
         lock (StateGate)
         {
-            return SetReturn(ctx, Players.ContainsKey(ctx[CpuRegister.Rdi]) ? 2 : InvalidParameters);
+            return SetReturn(
+                ctx,
+                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player)
+                    ? player.HasAudio ? 2 : 1
+                    : InvalidParameters);
         }
     }
 
@@ -568,7 +821,12 @@ public static class AvPlayerExports
         ulong handle,
         int width,
         int height,
-        ulong durationMilliseconds)
+        ulong durationMilliseconds,
+        ulong allocateTextureCallback = 0,
+        ulong allocateCallback = 0,
+        bool hasAudio = false,
+        double framesPerSecond = 30.0,
+        bool isGen5 = true)
     {
         PlayerState? previous;
         lock (StateGate)
@@ -577,13 +835,38 @@ public static class AvPlayerExports
             Players[handle] = new PlayerState
             {
                 Handle = handle,
+                IsGen5 = isGen5,
                 Width = width,
                 Height = height,
                 DurationMilliseconds = durationMilliseconds,
+                HasAudio = hasAudio,
+                FramesPerSecond = framesPerSecond,
+                AllocateTextureCallback = allocateTextureCallback,
+                AllocateCallback = allocateCallback,
             };
         }
 
         previous?.Dispose();
+    }
+
+    internal static bool AllocateGuestVideoBuffersForTest(
+        CpuContext ctx,
+        ulong handle,
+        out ulong firstBuffer)
+    {
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(handle, out var player))
+            {
+                firstBuffer = 0;
+                return false;
+            }
+
+            var bufferSize = GetVideoBufferSize(player);
+            var allocated = AllocateGuestVideoBuffers(ctx, player, bufferSize);
+            firstBuffer = player.GuestBuffers[0];
+            return allocated && firstBuffer != 0;
+        }
     }
 
     internal static void RemovePlayerForTest(ulong handle)
@@ -603,23 +886,27 @@ public static class AvPlayerExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerGetStreamInfo(CpuContext ctx) =>
-        GetStreamInfoCore(ctx, StreamInfoSize);
+        GetStreamInfoCore(ctx);
 
-    private static int GetStreamInfoCore(CpuContext ctx, int infoSize)
+    private static int GetStreamInfoCore(CpuContext ctx)
     {
         var streamIndex = unchecked((uint)ctx[CpuRegister.Rsi]);
         var infoAddress = ctx[CpuRegister.Rdx];
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                streamIndex > 1 || infoAddress == 0 || player.Width <= 0 || player.Height <= 0)
+                streamIndex > (player.HasAudio ? 1u : 0u) ||
+                infoAddress == 0 || player.Width <= 0 || player.Height <= 0)
             {
                 return SetReturn(ctx, InvalidParameters);
             }
 
+            var infoSize = GetLegacyStreamInfoSize(ctx.TargetGeneration);
             Span<byte> info = stackalloc byte[infoSize];
             info.Clear();
-            BinaryPrimitives.WriteUInt32LittleEndian(info[0..], streamIndex); // 0=video, 1=audio
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                info[0..],
+                GetStreamType(ctx.TargetGeneration, streamIndex));
             if (streamIndex == 0)
             {
                 BinaryPrimitives.WriteUInt32LittleEndian(info[8..], checked((uint)player.Width));
@@ -637,6 +924,10 @@ public static class AvPlayerExports
                 return SetReturn(ctx, InvalidParameters);
             }
 
+            TraceOnce(
+                $"stream_info_{streamIndex}_{infoSize}",
+                $"stream_info index={streamIndex} size={infoSize} " +
+                $"type={(streamIndex == 0 ? "video" : "audio")} duration_ms={player.DurationMilliseconds}");
             return SetReturn(ctx, 0);
         }
     }
@@ -654,7 +945,14 @@ public static class AvPlayerExports
             player = foundPlayer;
 
             var hostPath = ResolveGuestPath(guestPath);
-            if (hostPath is null || !ProbeVideo(hostPath, out var width, out var height, out var fps, out var duration))
+            if (hostPath is null ||
+                !ProbeVideo(
+                    hostPath,
+                    out var width,
+                    out var height,
+                    out var fps,
+                    out var duration,
+                    out var hasAudio))
             {
                 Console.Error.WriteLine($"[AVPLAYER][ERROR] Could not open guest video '{guestPath}' (resolved '{hostPath ?? "<none>"}').");
                 return SetReturn(ctx, OperationFailed);
@@ -666,12 +964,13 @@ public static class AvPlayerExports
             player.Height = height;
             player.FramesPerSecond = fps;
             player.DurationMilliseconds = duration;
+            player.HasAudio = hasAudio;
             player.Started = player.AutoStart;
             autoStart = player.AutoStart;
-            Trace($"source guest='{guestPath}' host='{hostPath}' {width}x{height} fps={fps:F3} duration_ms={duration} auto_start={player.AutoStart}");
+            Trace(
+                $"source guest='{guestPath}' host='{hostPath}' {width}x{height} " +
+                $"fps={fps:F3} duration_ms={duration} audio={hasAudio} auto_start={player.AutoStart}");
         }
-
-
         NotifyEvent(ctx, player, 2); // StateReady
         if (autoStart)
         {
@@ -686,10 +985,21 @@ public static class AvPlayerExports
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
+                infoAddress == 0 || !player.Started || player.EndOfStream ||
                 player.SourcePath is null)
             {
                 return SetReturn(ctx, 0);
+            }
+
+            if (player.Paused)
+            {
+                return SetReturn(
+                    ctx,
+                    player.IsGen5 &&
+                    player.LastGuestBuffer != 0 &&
+                    WriteHeldVideoFrameInfo(ctx, player, infoAddress, extended)
+                        ? 1
+                        : 0);
             }
 
             if (!EnsureDecoder(player))
@@ -699,7 +1009,20 @@ public static class AvPlayerExports
             }
 
             var fps = Math.Max(1.0, player.FramesPerSecond);
-            var expectedFrame = (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps);
+            var expectedFrame =
+                (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps) -
+                player.SkippedFrameDebt;
+            var behind = expectedFrame - player.NextFrameIndex;
+            if (behind > MaxCatchUpFrames)
+            {
+                player.SkippedFrameDebt += behind - MaxCatchUpFrames;
+                expectedFrame = player.NextFrameIndex + MaxCatchUpFrames;
+                TraceOnce(
+                    "catch_up_capped",
+                    $"catch_up capped behind={behind} max={MaxCatchUpFrames} " +
+                    $"fps={fps:F3} {player.Width}x{player.Height}");
+            }
+
             while (player.NextFrameIndex < expectedFrame)
             {
                 if (!ReadFrame(player))
@@ -720,6 +1043,7 @@ public static class AvPlayerExports
             {
                 return SetReturn(ctx, 0);
             }
+            player.LastVideoTimestamp = timestamp;
 
             Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts={timestamp} data=0x{player.LastGuestBuffer:X16}");
             return SetReturn(ctx, 1);
@@ -748,62 +1072,28 @@ public static class AvPlayerExports
             return true;
         }
 
-        var ffmpeg = FindFfmpeg();
-        if (ffmpeg is null || player.SourcePath is null)
+        if (player.SourcePath is null)
         {
-            Console.Error.WriteLine("[AVPLAYER][ERROR] FFmpeg was not found. Set SHARPEMU_FFMPEG_PATH.");
             return false;
         }
 
-        var startInfo = new ProcessStartInfo(ffmpeg)
+        if (!FfmpegMediaStream.TryOpenVideo(
+                player.SourcePath,
+                checked((int)player.Width),
+                checked((int)player.Height),
+                out var videoStream) ||
+            videoStream is null)
         {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        startInfo.ArgumentList.Add("-nostdin");
-        startInfo.ArgumentList.Add("-hide_banner");
-        startInfo.ArgumentList.Add("-loglevel");
-        startInfo.ArgumentList.Add("error");
-        startInfo.ArgumentList.Add("-i");
-        startInfo.ArgumentList.Add(player.SourcePath);
-        startInfo.ArgumentList.Add("-map");
-        startInfo.ArgumentList.Add("0:v:0");
-        startInfo.ArgumentList.Add("-an");
-        startInfo.ArgumentList.Add("-pix_fmt");
-        startInfo.ArgumentList.Add("nv12");
-        startInfo.ArgumentList.Add("-f");
-        startInfo.ArgumentList.Add("rawvideo");
-        startInfo.ArgumentList.Add("pipe:1");
-
-        try
-        {
-            player.Decoder = Process.Start(startInfo);
-            if (player.Decoder is null)
-            {
-                return false;
-            }
-            player.Decoder.ErrorDataReceived += (_, eventArgs) =>
-            {
-                if (!string.IsNullOrWhiteSpace(eventArgs.Data))
-                {
-                    Console.Error.WriteLine($"[AVPLAYER][FFMPEG] {eventArgs.Data}");
-                }
-            };
-            player.Decoder.BeginErrorReadLine();
-            player.DecoderOutput = player.Decoder.StandardOutput.BaseStream;
-            player.RawFrame = new byte[checked(player.Width * player.Height * 3 / 2)];
-            player.PlaybackClock.Start();
-            Trace($"decoder_started pid={player.Decoder.Id} source='{player.SourcePath}'");
-            return true;
-        }
-        catch (Exception exception) when (exception is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
-        {
-            Console.Error.WriteLine($"[AVPLAYER][ERROR] Failed to launch FFmpeg: {exception.Message}");
-            player.Dispose();
+            Console.Error.WriteLine(
+                $"[AVPLAYER][ERROR] Could not open a video stream in '{player.SourcePath}'.");
             return false;
         }
+
+        player.DecoderOutput = videoStream;
+        player.RawFrame = new byte[checked(player.Width * player.Height * 3 / 2)];
+        player.PlaybackClock.Start();
+        Trace($"decoder_started source='{player.SourcePath}' {player.Width}x{player.Height} nv12");
+        return true;
     }
 
     private static bool EnsureAudioDecoder(PlayerState player)
@@ -813,65 +1103,21 @@ public static class AvPlayerExports
             return true;
         }
 
-        var ffmpeg = FindFfmpeg();
-        if (ffmpeg is null || player.SourcePath is null)
+        if (player.SourcePath is null)
         {
             return false;
         }
 
-        var startInfo = new ProcessStartInfo(ffmpeg)
+        if (!FfmpegMediaStream.TryOpenAudio(player.SourcePath, out var audioStream) ||
+            audioStream is null)
         {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        startInfo.ArgumentList.Add("-nostdin");
-        startInfo.ArgumentList.Add("-hide_banner");
-        startInfo.ArgumentList.Add("-loglevel");
-        startInfo.ArgumentList.Add("error");
-        startInfo.ArgumentList.Add("-i");
-        startInfo.ArgumentList.Add(player.SourcePath);
-        startInfo.ArgumentList.Add("-map");
-        startInfo.ArgumentList.Add("0:a:0");
-        startInfo.ArgumentList.Add("-vn");
-        startInfo.ArgumentList.Add("-ac");
-        startInfo.ArgumentList.Add("2");
-        startInfo.ArgumentList.Add("-ar");
-        startInfo.ArgumentList.Add("48000");
-        startInfo.ArgumentList.Add("-f");
-        startInfo.ArgumentList.Add("s16le");
-        startInfo.ArgumentList.Add("pipe:1");
-
-        try
-        {
-            player.AudioDecoder = Process.Start(startInfo);
-            if (player.AudioDecoder is null)
-            {
-                return false;
-            }
-            player.AudioDecoder.ErrorDataReceived += (_, eventArgs) =>
-            {
-                if (!string.IsNullOrWhiteSpace(eventArgs.Data))
-                {
-                    Console.Error.WriteLine($"[AVPLAYER][FFMPEG-AUDIO] {eventArgs.Data}");
-                }
-            };
-            player.AudioDecoder.BeginErrorReadLine();
-            player.AudioDecoderOutput = player.AudioDecoder.StandardOutput.BaseStream;
-            player.RawAudioFrame = new byte[1024 * 2 * sizeof(short)];
-            Trace($"audio_decoder_started pid={player.AudioDecoder.Id} source='{player.SourcePath}'");
-            return true;
-        }
-        catch (Exception exception) when (exception is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
-        {
-            Console.Error.WriteLine($"[AVPLAYER][ERROR] Failed to launch FFmpeg audio decoder: {exception.Message}");
-            player.AudioDecoderOutput?.Dispose();
-            player.AudioDecoderOutput = null;
-            player.AudioDecoder?.Dispose();
-            player.AudioDecoder = null;
             return false;
         }
+
+        player.AudioDecoderOutput = audioStream;
+        player.RawAudioFrame = new byte[1024 * FfmpegMediaStream.AudioChannels * sizeof(short)];
+        Trace($"audio_decoder_started source='{player.SourcePath}' s16 stereo 48000");
+        return true;
     }
 
     private static bool ReadFrame(PlayerState player)
@@ -925,7 +1171,8 @@ public static class AvPlayerExports
 
         var alignedWidth = AlignUp(player.Width, 16);
         var alignedHeight = AlignUp(player.Height, 16);
-        var bufferStride = checked(alignedWidth * alignedHeight * 3 / 2);
+        var (pitch, bufferHeight) = GetFrameGeometry(player, extended);
+        var bufferStride = CalculateNv12BufferSize(pitch, bufferHeight);
         if (player.GuestBuffers[0] == 0)
         {
             if (!AllocateGuestVideoBuffers(ctx, player, bufferStride))
@@ -933,12 +1180,34 @@ public static class AvPlayerExports
                 return false;
             }
             player.GuestBufferStride = bufferStride;
+            Trace(
+                $"video_layout ex={extended} width={player.Width} height={player.Height} " +
+                $"pitch={pitch} uv_offset={checked(pitch * bufferHeight)} size={bufferStride}");
         }
 
         var frameData = player.RawFrame;
-        if (!extended && (alignedWidth != player.Width || alignedHeight != player.Height))
+        if (extended)
         {
-            player.PaddedFrame ??= new byte[bufferStride];
+            if (player.PaddedFrame is null || player.PaddedFrame.Length != bufferStride)
+            {
+                player.PaddedFrame = new byte[bufferStride];
+            }
+            CopyNv12ToGuestBuffer(
+                player.RawFrame,
+                player.PaddedFrame,
+                player.Width,
+                player.Height,
+                player.Width,
+                player.Width,
+                pitch);
+            frameData = player.PaddedFrame;
+        }
+        else if (alignedWidth != player.Width || alignedHeight != player.Height)
+        {
+            if (player.PaddedFrame is null || player.PaddedFrame.Length != bufferStride)
+            {
+                player.PaddedFrame = new byte[bufferStride];
+            }
             player.PaddedFrame.AsSpan().Clear();
             for (var row = 0; row < player.Height; row++)
             {
@@ -962,58 +1231,271 @@ public static class AvPlayerExports
         {
             return false;
         }
+        if (player.TextureAllocatorFailed)
+        {
+            EnsureFallbackPlayback(player);
+            if (player.FallbackPresentationPixels is null)
+            {
+                // Keep one immediate poster frame while the background decoder
+                // starts. Subsequent frames come from the bounded, scaled host
+                // playback; converting every 4K NV12 guest frame here would
+                // duplicate decoding work and dominate the emulation thread.
+                var bgra = GC.AllocateUninitializedArray<byte>(
+                    checked(player.Width * player.Height * 4));
+                ConvertNv12ToBgra(
+                    frameData,
+                    pitch,
+                    bufferHeight,
+                    player.Width,
+                    player.Height,
+                    bgra);
+                player.FallbackPresentationPixels = bgra;
+                player.FallbackPresentationWidth = checked((uint)player.Width);
+                player.FallbackPresentationHeight = checked((uint)player.Height);
+                player.FallbackPresentationSerial =
+                    Interlocked.Increment(ref _fallbackPresentationSerial);
+                player.SkipFirstFallbackPlaybackFrame =
+                    player.FallbackPlayback is not null;
+            }
+        }
+        if (TraceVideoImages)
+        {
+            var traceIndex = Interlocked.Increment(ref _videoPayloadTraceCount);
+            if (traceIndex <= 16)
+            {
+                var summary = GuestImageUploadPayloadDiagnostics.Summarize(frameData);
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][TRACE] video_payload index={traceIndex - 1} " +
+                    $"data=0x{bufferAddress:X16} bytes={frameData.Length} " +
+                    $"pitch={pitch} uv_offset={checked(pitch * bufferHeight)} " +
+                    $"nonzero_bytes={summary.NonzeroBytes}/{frameData.Length} " +
+                    $"hash=0x{summary.Hash:X16}");
+            }
+        }
 
         Span<byte> info = extended
             ? stackalloc byte[FrameInfoExSize]
             : stackalloc byte[FrameInfoSize];
         info.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], timestamp);
-        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], checked((uint)(extended ? player.Width : alignedWidth)));
-        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], checked((uint)(extended ? player.Height : alignedHeight)));
-        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
-        if (extended)
-        {
-            BinaryPrimitives.WriteUInt32LittleEndian(info[60..], checked((uint)player.Width));
-            info[64] = 8;
-            info[65] = 8;
-        }
+        WriteVideoFrameInfo(
+            info,
+            ctx.TargetGeneration,
+            extended,
+            bufferAddress,
+            timestamp,
+            checked((uint)pitch),
+            checked((uint)player.Width),
+            checked((uint)(extended ? player.Height : bufferHeight)),
+            checked((uint)pitch),
+            player.FramesPerSecond);
         return ctx.Memory.TryWrite(infoAddress, info);
+    }
+
+    private static (int Pitch, int Height) GetFrameGeometry(
+        PlayerState player,
+        bool extended)
+    {
+        var gen5Extended = extended && player.IsGen5;
+        return (
+            gen5Extended ? CalculateNv12Pitch(player.Width) : AlignUp(player.Width, 16),
+            gen5Extended ? player.Height : AlignUp(player.Height, 16));
+    }
+
+    private static bool WriteHeldVideoFrameInfo(
+        CpuContext ctx,
+        PlayerState player,
+        ulong infoAddress,
+        bool extended)
+    {
+        var (pitch, bufferHeight) = GetFrameGeometry(player, extended);
+        Span<byte> info = extended
+            ? stackalloc byte[FrameInfoExSize]
+            : stackalloc byte[FrameInfoSize];
+        info.Clear();
+        WriteVideoFrameInfo(
+            info,
+            ctx.TargetGeneration,
+            extended,
+            player.LastGuestBuffer,
+            player.LastVideoTimestamp,
+            checked((uint)pitch),
+            checked((uint)player.Width),
+            checked((uint)(extended ? player.Height : bufferHeight)),
+            checked((uint)pitch),
+            player.FramesPerSecond);
+        return ctx.Memory.TryWrite(infoAddress, info);
+    }
+
+    /// <summary>
+    /// The title-provided allocators can reject large decoded surfaces.  In
+    /// that case the guest has no texture it can sample, and some titles pause
+    /// their AvPlayer after acquiring a poster frame.  Keep that compatibility
+    /// path useful by running a separate, bounded host playback to completion.
+    /// MediaFramePlayback performs decode work off the Vulkan thread, advances
+    /// on the movie clock, drops frames when rendering is slow, and relinquishes
+    /// presentation automatically at EOF so normal guest rendering resumes.
+    /// </summary>
+    private static void EnsureFallbackPlayback(PlayerState player)
+    {
+        if (player.FallbackPlaybackAttempted || player.SourcePath is null)
+        {
+            return;
+        }
+
+        player.FallbackPlaybackAttempted = true;
+        var videoOptions = HostVideoHost.CurrentOptions;
+        var maximumWidth = checked((uint)videoOptions.Width);
+        var maximumHeight = checked((uint)videoOptions.Height);
+        if (!FfmpegVideoDecoder.TryOpen(
+                player.SourcePath,
+                maximumWidth,
+                maximumHeight,
+                out var decoder) ||
+            decoder is null)
+        {
+            Console.Error.WriteLine(
+                $"[AVPLAYER][WARN] Could not start host fallback playback for '{player.SourcePath}'.");
+            return;
+        }
+
+        player.FallbackPlayback = new MediaFramePlayback(decoder);
+        Trace(
+            $"host_fallback_started handle=0x{player.Handle:X16} " +
+            $"source={player.Width}x{player.Height} output={decoder.Width}x{decoder.Height} " +
+            $"host_limit={maximumWidth}x{maximumHeight} " +
+            $"fps={decoder.FramesPerSecondNumerator}/{decoder.FramesPerSecondDenominator}");
+    }
+
+    internal static int CalculateNv12Pitch(int width) =>
+        AlignUp(width, VideoPitchAlignment);
+
+    internal static int CalculateNv12BufferSize(int pitch, int height) =>
+        checked(pitch * height * 3 / 2);
+
+    internal static void ConvertNv12ToBgra(
+        ReadOnlySpan<byte> nv12,
+        int pitch,
+        int bufferHeight,
+        int width,
+        int height,
+        Span<byte> bgra)
+    {
+        var requiredNv12 = CalculateNv12BufferSize(pitch, bufferHeight);
+        var requiredBgra = checked(width * height * 4);
+        if (pitch < width || bufferHeight < height ||
+            nv12.Length < requiredNv12 || bgra.Length < requiredBgra)
+        {
+            throw new ArgumentException("NV12 frame dimensions do not match the supplied buffers.");
+        }
+
+        var chromaOffset = checked(pitch * bufferHeight);
+        for (var y = 0; y < height; y++)
+        {
+            var lumaRow = y * pitch;
+            var chromaRow = chromaOffset + ((y >> 1) * pitch);
+            var outputRow = y * width * 4;
+            for (var x = 0; x < width; x++)
+            {
+                var luma = nv12[lumaRow + x];
+                var chromaColumn = x & ~1;
+                var u = nv12[chromaRow + chromaColumn];
+                var v = nv12[chromaRow + chromaColumn + 1];
+                var c = Math.Max(0, luma - 16);
+                var d = u - 128;
+                var e = v - 128;
+                var output = outputRow + (x * 4);
+                bgra[output] = ClampToByte((298 * c + 516 * d + 128) >> 8);
+                bgra[output + 1] = ClampToByte((298 * c - 100 * d - 208 * e + 128) >> 8);
+                bgra[output + 2] = ClampToByte((298 * c + 409 * e + 128) >> 8);
+                bgra[output + 3] = byte.MaxValue;
+            }
+        }
+    }
+
+    private static byte ClampToByte(int value) =>
+        checked((byte)Math.Clamp(value, byte.MinValue, byte.MaxValue));
+
+    private static int GetVideoBufferSize(PlayerState player) =>
+        checked(
+            AlignUp(player.Width, FramePitchAlignment) *
+            AlignUp(player.Height, FrameHeightAlignment) * 3 / 2);
+
+    internal static void CopyNv12ToGuestBuffer(
+        ReadOnlySpan<byte> source,
+        Span<byte> destination,
+        int width,
+        int height,
+        int sourceLumaStride,
+        int sourceChromaStride,
+        int destinationPitch)
+    {
+        var sourceChromaOffset = checked(sourceLumaStride * height);
+        var destinationChromaOffset = checked(destinationPitch * height);
+        var destinationSize = CalculateNv12BufferSize(destinationPitch, height);
+        destination[..destinationSize].Clear();
+
+        for (var row = 0; row < height; row++)
+        {
+            source.Slice(row * sourceLumaStride, width)
+                .CopyTo(destination.Slice(row * destinationPitch, width));
+        }
+        for (var row = 0; row < height / 2; row++)
+        {
+            source.Slice(sourceChromaOffset + (row * sourceChromaStride), width)
+                .CopyTo(destination.Slice(destinationChromaOffset + (row * destinationPitch), width));
+        }
     }
 
     private static bool AllocateGuestVideoBuffers(CpuContext ctx, PlayerState player, int bufferSize)
     {
         var scheduler = GuestThreadExecution.Scheduler;
-        if (!player.TextureAllocatorFailed && player.AllocateTextureCallback != 0 && scheduler is not null)
+        if (!player.TextureAllocatorFailed && scheduler is not null)
         {
-            for (var index = 0; index < player.GuestBuffers.Length; index++)
+            foreach (var (callback, kind) in new[]
+                     {
+                         (player.AllocateTextureCallback, "texture"),
+                         (player.AllocateCallback, "generic"),
+                     })
             {
-                if (!scheduler.TryCallGuestFunction(
-                        ctx,
-                        player.AllocateTextureCallback,
-                        player.AllocatorObject,
-                        0x100,
-                        checked((ulong)bufferSize),
-                        0,
-                        0,
-                        "avplayer_allocate_texture",
-                        out var buffer,
-                        out var error) || buffer == 0)
+                if (callback == 0)
                 {
-                    Console.Error.WriteLine(
-                        $"[AVPLAYER][ERROR] Guest texture allocation failed index={index} " +
-                        $"callback=0x{player.AllocateTextureCallback:X16}: {error ?? "returned null"}");
-                    player.TextureAllocatorFailed = true;
-                    Array.Clear(player.GuestBuffers);
-                    break;
+                    continue;
                 }
-                player.GuestBuffers[index] = buffer;
-                Trace($"texture_buffer index={index} data=0x{buffer:X16} size={bufferSize}");
+
+                var allocated = true;
+                for (var index = 0; index < player.GuestBuffers.Length; index++)
+                {
+                    if (!scheduler.TryCallGuestFunction(
+                            ctx,
+                            callback,
+                            player.AllocatorObject,
+                            TextureAllocationAlignment,
+                            checked((ulong)bufferSize),
+                            0,
+                            0,
+                            "avplayer_allocate_" + kind,
+                            out var buffer,
+                            out var error) || buffer == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[AVPLAYER][WARN] Guest {kind} allocation failed index={index} " +
+                            $"callback=0x{callback:X16} size={bufferSize} " +
+                            $"align=0x{TextureAllocationAlignment:X}: {error ?? "returned null"}");
+                        allocated = false;
+                        Array.Clear(player.GuestBuffers);
+                        break;
+                    }
+                    player.GuestBuffers[index] = buffer;
+                    RegisterVideoBuffer(buffer, bufferSize, index, "guest-callback");
+                    Trace($"{kind}_buffer index={index} data=0x{buffer:X16} size={bufferSize}");
+                }
+
+                if (allocated)
+                {
+                    return true;
+                }
             }
-            if (!player.TextureAllocatorFailed)
-            {
-                return true;
-            }
+            player.TextureAllocatorFailed = true;
         }
 
         if (!KernelMemoryCompatExports.TryAllocateHleData(
@@ -1027,6 +1509,7 @@ public static class AvPlayerExports
         for (var index = 0; index < player.GuestBuffers.Length; index++)
         {
             player.GuestBuffers[index] = bufferBase + checked((ulong)(index * bufferSize));
+            RegisterVideoBuffer(player.GuestBuffers[index], bufferSize, index, "hle-fallback");
         }
         Console.Error.WriteLine("[AVPLAYER][WARN] Guest texture allocator unavailable; using generic HLE memory.");
         return true;
@@ -1037,163 +1520,36 @@ public static class AvPlayerExports
         out int width,
         out int height,
         out double framesPerSecond,
-        out ulong durationMilliseconds)
+        out ulong durationMilliseconds,
+        out bool hasAudio)
     {
         width = 0;
         height = 0;
         framesPerSecond = 30.0;
         durationMilliseconds = 0;
-        var ffmpeg = FindFfmpeg();
-        if (ffmpeg is null)
-        {
-            return false;
-        }
-        var ffprobe = GetFfprobePath(ffmpeg, OperatingSystem.IsWindows());
-        if (!File.Exists(ffprobe))
+        hasAudio = false;
+
+        if (!FfmpegMediaStream.TryProbe(path, out width, out height, out var rate, out var duration))
         {
             return false;
         }
 
-        var startInfo = new ProcessStartInfo(ffprobe)
+        if (rate > 0)
         {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        startInfo.ArgumentList.Add("-v");
-        startInfo.ArgumentList.Add("error");
-        startInfo.ArgumentList.Add("-select_streams");
-        startInfo.ArgumentList.Add("v:0");
-        startInfo.ArgumentList.Add("-show_entries");
-        startInfo.ArgumentList.Add("stream=width,height,avg_frame_rate,duration");
-        startInfo.ArgumentList.Add("-of");
-        startInfo.ArgumentList.Add("default=noprint_wrappers=1");
-        startInfo.ArgumentList.Add(path);
-
-        try
-        {
-            using var process = Process.Start(startInfo);
-            if (process is null)
-            {
-                return false;
-            }
-            var output = process.StandardOutput.ReadToEnd();
-            var error = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-            if (process.ExitCode != 0)
-            {
-                Console.Error.WriteLine($"[AVPLAYER][FFPROBE] {error.Trim()}");
-                return false;
-            }
-
-            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                var separator = line.IndexOf('=');
-                if (separator < 1)
-                {
-                    continue;
-                }
-                var key = line[..separator];
-                var value = line[(separator + 1)..];
-                switch (key)
-                {
-                    case "width":
-                        _ = int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out width);
-                        break;
-                    case "height":
-                        _ = int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out height);
-                        break;
-                    case "avg_frame_rate":
-                        var parts = value.Split('/');
-                        if (parts.Length == 2 &&
-                            double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator) &&
-                            double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator) &&
-                            denominator != 0)
-                        {
-                            framesPerSecond = numerator / denominator;
-                        }
-                        break;
-                    case "duration":
-                        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var duration))
-                        {
-                            durationMilliseconds = checked((ulong)Math.Max(0, Math.Round(duration * 1000.0)));
-                        }
-                        break;
-                }
-            }
-            return width > 0 && height > 0 && framesPerSecond > 0;
+            framesPerSecond = rate;
         }
-        catch (Exception exception) when (exception is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
+
+        if (duration > 0)
         {
-            Console.Error.WriteLine($"[AVPLAYER][ERROR] Failed to probe video: {exception.Message}");
-            return false;
+            durationMilliseconds = checked((ulong)Math.Max(0, Math.Round(duration * 1000.0)));
         }
+
+        hasAudio = FfmpegMediaStream.TryOpenAudio(path, out var audioStream) &&
+                   audioStream is not null;
+        audioStream?.Dispose();
+
+        return width > 0 && height > 0 && framesPerSecond > 0;
     }
-
-    internal static string? FindFfmpeg() =>
-        FindFfmpeg(
-            Environment.GetEnvironmentVariable("SHARPEMU_FFMPEG_PATH"),
-            Environment.GetEnvironmentVariable("PATH"),
-            OperatingSystem.IsWindows(),
-            AppContext.BaseDirectory);
-
-    internal static string? FindFfmpeg(
-        string? configured,
-        string? searchPath,
-        bool isWindows,
-        string? baseDirectory = null)
-    {
-        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
-        {
-            return configured;
-        }
-
-        var executable = isWindows ? "ffmpeg.exe" : "ffmpeg";
-        if (!string.IsNullOrWhiteSpace(baseDirectory))
-        {
-            foreach (var candidate in new[]
-                     {
-                         Path.Combine(baseDirectory, executable),
-                         Path.Combine(baseDirectory, "ffmpeg", executable),
-                     })
-            {
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
-        }
-
-        foreach (var directory in (searchPath ?? string.Empty)
-                     .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-        {
-            var candidate = Path.Combine(RemovePathQuotes(directory), executable);
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-
-        foreach (var candidate in new[] { "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" })
-        {
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-        return null;
-    }
-
-    internal static string GetFfprobePath(string ffmpeg, bool isWindows) =>
-        Path.Combine(
-            Path.GetDirectoryName(ffmpeg) ?? string.Empty,
-            isWindows ? "ffprobe.exe" : "ffprobe");
-
-    private static string RemovePathQuotes(string directory) =>
-        directory.Length >= 2 && directory[0] == '"' && directory[^1] == '"'
-            ? directory[1..^1]
-            : directory;
 
     internal static string? ResolveGuestPath(string guestPath)
     {
@@ -1481,6 +1837,104 @@ public static class AvPlayerExports
         return true;
     }
 
+    internal static bool IsValidBgraFrame(
+        ReadOnlySpan<byte> pixels,
+        uint width,
+        uint height)
+    {
+        if (width == 0 || height == 0)
+        {
+            return false;
+        }
+
+        var requiredBytes = (ulong)width * height * 4;
+        return requiredBytes <= int.MaxValue &&
+               pixels.Length >= checked((int)requiredBytes);
+    }
+
+    internal static bool IsGen5Target(Generation generation) =>
+        (generation & Generation.Gen5) != 0;
+
+    internal static ulong GetAutoStartOffset(Generation generation, bool extended) =>
+        IsGen5Target(generation)
+            ? extended ? 168UL : 112UL
+            : extended ? 164UL : 108UL;
+
+    internal static int GetLegacyStreamInfoSize(Generation generation) =>
+        IsGen5Target(generation)
+            ? Gen5StreamInfoSize
+            : Gen4StreamInfoSize;
+
+    internal static uint GetStreamType(Generation generation, uint streamIndex) =>
+        IsGen5Target(generation)
+            ? streamIndex + 1
+            : streamIndex;
+
+    internal static void WriteGen5StreamInfoEx(
+        Span<byte> info,
+        uint streamType,
+        uint width,
+        uint height,
+        double framesPerSecond,
+        ulong durationMilliseconds)
+    {
+        if (info.Length < StreamInfoExSize)
+        {
+            throw new ArgumentException(
+                $"Stream-info buffer must contain at least {StreamInfoExSize} bytes.",
+                nameof(info));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], StreamInfoExSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[8..], streamType);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[16..], width);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[20..], height);
+        BinaryPrimitives.WriteDoubleLittleEndian(info[0x40..], framesPerSecond);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0x60..], durationMilliseconds);
+    }
+
+    internal static void WriteVideoFrameInfo(
+        Span<byte> info,
+        Generation generation,
+        bool extended,
+        ulong bufferAddress,
+        ulong timestamp,
+        uint width,
+        uint visibleWidth,
+        uint height,
+        uint pitch,
+        double framesPerSecond)
+    {
+        var requiredSize = extended ? FrameInfoExSize : FrameInfoSize;
+        if (info.Length < requiredSize)
+        {
+            throw new ArgumentException(
+                $"Frame-info buffer must contain at least {requiredSize} bytes.",
+                nameof(info));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], timestamp);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], width);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], height);
+        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
+        if (!extended)
+        {
+            return;
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            info[48..],
+            width > visibleWidth ? width - visibleWidth : 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[60..], pitch);
+        info[64] = 8;
+        info[65] = 8;
+        if (IsGen5Target(generation))
+        {
+            BinaryPrimitives.WriteDoubleLittleEndian(info[0x48..], framesPerSecond);
+        }
+    }
+
     private static bool TryReadNullTerminatedUtf8(CpuContext ctx, ulong address, int maxLength, out string value)
     {
         value = string.Empty;
@@ -1605,5 +2059,18 @@ public static class AvPlayerExports
         {
             Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");
         }
+    }
+
+    private static void TraceOnce(string key, string message)
+    {
+        lock (TracedOnce)
+        {
+            if (!TracedOnce.Add(key))
+            {
+                return;
+            }
+        }
+
+        Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");
     }
 }

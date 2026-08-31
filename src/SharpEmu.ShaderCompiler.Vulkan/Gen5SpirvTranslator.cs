@@ -176,6 +176,11 @@ public static partial class Gen5SpirvTranslator
         private const uint ImageDescriptorDwords = 8;
         private const uint SamplerDescriptorDwords = 4;
         private const int ScalarRegisterCount = 128;
+
+        // M0. Used as the runtime index added to the register numbers encoded in
+        // the V_MOVREL* instructions, and as the LDS/GDS base elsewhere.
+        private const uint M0ScalarRegister = 124;
+
         private const long InitialScalarDefinition = -1;
         private const long ConflictingScalarDefinition = -2;
         private const long UnreachableScalarDefinition = -3;
@@ -712,6 +717,8 @@ public static partial class Gen5SpirvTranslator
             if (UsesSubgroupOperations())
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniform);
+                _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
+
                 if (UsesSubgroupShuffle())
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformShuffle);
@@ -722,10 +729,6 @@ public static partial class Gen5SpirvTranslator
                     _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 }
 
-                if (UsesSubgroupBroadcast() || UsesWaveControl())
-                {
-                    _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
-                }
             }
 
             _glsl = _module.ImportExtInst("GLSL.std.450");
@@ -1365,14 +1368,18 @@ public static partial class Gen5SpirvTranslator
                     variable,
                     SpirvDecoration.Location,
                     input.Location);
-                _vertexInputsByPc.TryAdd(
-                    input.Pc,
-                    new SpirvVertexInput(
-                        variable,
-                        type,
-                        componentType,
-                        input.ComponentCount,
-                        componentKind));
+                var vertexInput = new SpirvVertexInput(
+                    variable,
+                    type,
+                    componentType,
+                    input.ComponentCount,
+                    componentKind);
+                _vertexInputsByPc.TryAdd(input.Pc, vertexInput);
+                foreach (var aliasPc in input.AliasPcs ?? [])
+                {
+                    _vertexInputsByPc.TryAdd(aliasPc, vertexInput);
+                }
+
                 _interfaces.Add(variable);
             }
         }
@@ -1799,13 +1806,16 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode == "SBarrier")
             {
-                var workgroup = UInt(2);
-                var semantics = UInt(0x108);
-                _module.AddStatement(
-                    SpirvOp.ControlBarrier,
-                    workgroup,
-                    workgroup,
-                    semantics);
+                if (_stage == Gen5SpirvStage.Compute)
+                {
+                    var workgroup = UInt(2);
+                    var semantics = UInt(0x108);
+                    _module.AddStatement(
+                        SpirvOp.ControlBarrier,
+                        workgroup,
+                        workgroup,
+                        semantics);
+                }
                 return true;
             }
 
@@ -2356,17 +2366,16 @@ public static partial class Gen5SpirvTranslator
                         return;
                     }
 
+                    // GLOBAL_STORE/LOAD_DWORD(x2/x3/x4) are dword-aligned by the GCN ISA, so read/write dwords directly instead of the per-byte loop.
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
-                        var address = index == 0
-                            ? byteAddress
-                            : IAdd(byteAddress, UInt(index * sizeof(uint)));
-                        StoreBufferBytes(
+                        var indexedDwordAddress = index == 0
+                            ? dwordAddress
+                            : IAdd(dwordAddress, UInt(index));
+                        StoreBufferWord(
                             bindingIndex,
-                            address,
-                            LoadV(control.VectorData + index),
-                            sizeof(uint),
-                            0);
+                            indexedDwordAddress,
+                            LoadV(control.VectorData + index));
                     }
                 });
                 return true;
@@ -2394,12 +2403,12 @@ public static partial class Gen5SpirvTranslator
 
             for (uint index = 0; index < control.DwordCount; index++)
             {
-                var address = index == 0
-                    ? byteAddress
-                    : IAdd(byteAddress, UInt(index * sizeof(uint)));
+                var indexedDwordAddress = index == 0
+                    ? dwordAddress
+                    : IAdd(dwordAddress, UInt(index));
                 StoreV(
                     control.VectorData + index,
-                    LoadUnalignedBufferWord(bindingIndex, address));
+                    LoadBufferWord(bindingIndex, indexedDwordAddress));
             }
 
             return true;
@@ -2500,17 +2509,16 @@ public static partial class Gen5SpirvTranslator
                         return;
                     }
 
+                    // BUFFER_STORE/LOAD_DWORD(x2/x3/x4) are dword-aligned by the GCN ISA, same as the GLOBAL case above — no per-byte reassembly needed.
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
-                        var address = index == 0
-                            ? byteAddress
-                            : IAdd(byteAddress, UInt(index * sizeof(uint)));
-                        StoreBufferBytes(
+                        var indexedDwordAddress = index == 0
+                            ? dwordAddress
+                            : IAdd(dwordAddress, UInt(index));
+                        StoreBufferWord(
                             bindingIndex,
-                            address,
-                            LoadV(control.VectorData + index),
-                            sizeof(uint),
-                            0);
+                            indexedDwordAddress,
+                            LoadV(control.VectorData + index));
                     }
                 });
 
@@ -2566,12 +2574,12 @@ public static partial class Gen5SpirvTranslator
 
             for (uint index = 0; index < control.DwordCount; index++)
             {
-                var address = index == 0
-                    ? byteAddress
-                    : IAdd(byteAddress, UInt(index * sizeof(uint)));
+                var indexedDwordAddress = index == 0
+                    ? dwordAddress
+                    : IAdd(dwordAddress, UInt(index));
                 StoreV(
                     control.VectorData + index,
-                    LoadUnalignedBufferWord(bindingIndex, address));
+                    LoadBufferWord(bindingIndex, indexedDwordAddress));
             }
 
             return true;
@@ -5084,6 +5092,33 @@ public static partial class Gen5SpirvTranslator
                 _privateUintPointer,
                 _vectorRegisters,
                 UInt(register));
+
+        // The V_MOVREL* opcodes address the VGPR file with a register number that
+        // is only known at run time (encoded number + M0), so the access chain
+        // takes a computed index instead of a constant. The index is masked to
+        // the array bounds: SPIR-V leaves an out-of-range Private access chain
+        // undefined, and a mask costs nothing next to the surrounding load.
+        private uint DynamicVectorPointer(uint registerIndex) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _vectorRegisters,
+                BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+
+        private uint LoadVDynamic(uint registerIndex) =>
+            Load(_uintType, DynamicVectorPointer(registerIndex));
+
+        private void StoreVDynamic(uint registerIndex, uint value)
+        {
+            var pointer = DynamicVectorPointer(registerIndex);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                value,
+                Load(_uintType, pointer));
+            Store(pointer, value);
+        }
 
         private uint PackedHalfPointer(uint register) =>
             _module.AddInstruction(

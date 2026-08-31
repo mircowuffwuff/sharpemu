@@ -59,6 +59,49 @@ internal static class GpuWaitRegistry
     // cycle forever even though a real producer did signal it. Keyed by (memory,
     // address) so distinct guest processes never alias.
     private static readonly Dictionary<(object, ulong), ulong> _lastProduced = new();
+    // Frame-staleness guard: tracks the frame ID of each label write so that
+    // WAIT_REG_MEM in frame N+1 is not satisfied by a stale write from frame N.
+    private static readonly Dictionary<(object, ulong), long> _labelFrameIds = new();
+    private static long _currentFrameId;
+
+  
+    private static object? Canonicalize(object? memory)
+    {
+        while (memory is SharpEmu.HLE.ICpuMemoryWrapper wrapper)
+        {
+            memory = wrapper.Inner;
+        }
+
+        return memory;
+    }
+
+    /// <summary>
+    /// Advances the frame counter. Called at each frame boundary (flip) so that
+    /// stale label writes from previous frames cannot satisfy WAIT_REG_MEM.
+    /// </summary>
+    public static void AdvanceFrame()
+    {
+        System.Threading.Interlocked.Increment(ref _currentFrameId);
+    }
+
+    /// <summary>
+    /// Returns true if the label at (memory, address) was written in the
+    /// current frame, or has never been written (uninitialized).
+    /// Only labels written in a PREVIOUS frame are considered stale.
+    /// </summary>
+    public static bool IsLabelFresh(object memory, ulong address)
+    {
+        memory = Canonicalize(memory)!;
+        lock (_gate)
+        {
+            if (!_labelFrameIds.TryGetValue((memory, address), out var frameId))
+            {
+                return true; // never written — treat as fresh (not stale)
+            }
+
+            return frameId >= System.Threading.Volatile.Read(ref _currentFrameId);
+        }
+    }
 
     public static int Count
     {
@@ -79,6 +122,7 @@ internal static class GpuWaitRegistry
 
     public static int CountForMemory(object memory)
     {
+        memory = Canonicalize(memory)!;
         lock (_gate)
         {
             var total = 0;
@@ -106,6 +150,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static OutstandingSnapshot SnapshotOutstanding(object? memory = null)
     {
+        memory = Canonicalize(memory);
         lock (_gate)
         {
             var outstanding = 0;
@@ -155,6 +200,7 @@ internal static class GpuWaitRegistry
     public static void Register(ulong address, WaitingDcb waiter)
     {
         waiter.WaitAddress = address;
+        waiter.Memory = Canonicalize(waiter.Memory);
         lock (_gate)
         {
             if (!_waiters.TryGetValue(address, out var list))
@@ -177,6 +223,7 @@ internal static class GpuWaitRegistry
         object memory,
         Func<ulong, bool, ulong?> readValue)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? woken = null;
         lock (_gate)
         {
@@ -237,6 +284,7 @@ internal static class GpuWaitRegistry
         long nowTicks,
         long maxAgeTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? stale = null;
         lock (_gate)
         {
@@ -273,6 +321,7 @@ internal static class GpuWaitRegistry
         ulong start,
         ulong length)
     {
+        memory = Canonicalize(memory)!;
         var matches = new List<(ulong Address, int Count)>();
         if (length == 0)
         {
@@ -328,6 +377,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static bool LatchSatisfiedByValue(object memory, ulong address, ulong value)
     {
+        memory = Canonicalize(memory)!;
         var latchedAny = false;
         lock (_gate)
         {
@@ -356,6 +406,56 @@ internal static class GpuWaitRegistry
     }
 
     /// <summary>
+    /// Every registered waiter, for the flip-stall watchdog. Not filtered by
+    /// memory identity — the watchdog wants a whole-process view.
+    /// </summary>
+    public static List<WaitingDcb> SnapshotAll()
+    {
+        var snapshot = new List<WaitingDcb>();
+        lock (_gate)
+        {
+            foreach (var (_, list) in _waiters)
+            {
+                snapshot.AddRange(list);
+            }
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Removes the waiter at <paramref name="address"/> whose State is
+    /// <paramref name="state"/> — used when a new submission supersedes a
+    /// ring-tail park that would otherwise pin the queue forever.
+    /// </summary>
+    public static bool TryRemoveByState(object state, ulong address)
+    {
+        lock (_gate)
+        {
+            if (!_waiters.TryGetValue(address, out var list))
+            {
+                return false;
+            }
+
+            for (var i = list.Count - 1; i >= 0; i--)
+            {
+                if (ReferenceEquals(list[i].State, state))
+                {
+                    list.RemoveAt(i);
+                    if (list.Count == 0)
+                    {
+                        _waiters.Remove(address);
+                    }
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Removes and returns waiters carrying a <see cref="WaitingDcb.RetryDeadlineTicks"/>
     /// that has elapsed. Used for indirect-dispatch dimension retries: the caller
     /// resumes them so a genuinely empty dispatch (dims that never become non-zero)
@@ -363,6 +463,7 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static List<WaitingDcb>? CollectExpiredRetries(object memory, long nowTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? expired = null;
         lock (_gate)
         {
@@ -405,6 +506,7 @@ internal static class GpuWaitRegistry
 
     public static List<WaitingDcb>? CollectAllForMemory(object memory)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? collected = null;
         lock (_gate)
         {
@@ -442,18 +544,71 @@ internal static class GpuWaitRegistry
         return collected;
     }
 
+    /// <summary>
+    /// Drops produced-label values that no registered waiter is watching. Called
+    /// under <see cref="_gate"/> when the table reaches its soft bound. A value
+    /// still watched by a waiter is the only thing that can release that waiter
+    /// once the guest recycles its label, so those are always retained even if
+    /// the table has to grow past the bound.
+    /// </summary>
+    private static void PruneUnwatchedProducedLocked()
+    {
+        List<(object Memory, ulong Address)>? unwatched = null;
+        foreach (var (key, _) in _lastProduced)
+        {
+            if (_waiters.TryGetValue(key.Item2, out var list))
+            {
+                var watched = false;
+                foreach (var waiter in list)
+                {
+                    if (ReferenceEquals(waiter.Memory, key.Item1))
+                    {
+                        watched = true;
+                        break;
+                    }
+                }
+
+                if (watched)
+                {
+                    continue;
+                }
+            }
+
+            (unwatched ??= []).Add(key);
+        }
+
+        if (unwatched is null)
+        {
+            return;
+        }
+
+        foreach (var key in unwatched)
+        {
+            _lastProduced.Remove(key);
+        }
+    }
+
     /// <summary>Records the value a label producer wrote, for the deadlock
     /// breaker. Also latches any already-waiting waiter it satisfies.</summary>
     public static bool RecordProduced(object memory, ulong address, ulong value)
     {
+        memory = Canonicalize(memory)!;
         lock (_gate)
         {
             if (_lastProduced.Count >= 8192)
             {
-                _lastProduced.Clear();
+                // These entries are release state, not a cache. CollectDeadlockBroken
+                // can only free a waiter whose label the guest has since recycled by
+                // replaying the value a real producer wrote to it, so clearing the
+                // table wholesale strands every such waiter forever — the suspended
+                // queue then never resumes and the title wedges with its render
+                // thread parked. Drop only values no live waiter is watching, and
+                // let the table exceed the bound when they all are.
+                PruneUnwatchedProducedLocked();
             }
 
             _lastProduced[(memory, address)] = value;
+            _labelFrameIds[(memory, address)] = System.Threading.Volatile.Read(ref _currentFrameId);
         }
 
         return LatchSatisfiedByValue(memory, address, value);
@@ -472,6 +627,7 @@ internal static class GpuWaitRegistry
         long nowTicks,
         long minAgeTicks)
     {
+        memory = Canonicalize(memory)!;
         List<WaitingDcb>? broken = null;
         lock (_gate)
         {
@@ -513,6 +669,21 @@ internal static class GpuWaitRegistry
         return broken;
     }
 
+    // Under orphan force-submit, producers can run ahead of waiter
+    // registration and pass an equal-compare value before it's ever seen.
+    // Treat == as "reached or passed" only in that mode, so other titles
+    // keep exact hardware semantics. SHARPEMU_GPU_WAIT_EQ_EXACT=1 restores
+    // strict equality for A/B.
+    private static readonly bool _equalCompareExact =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_EQ_EXACT"),
+            "1",
+            StringComparison.Ordinal) ||
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES"),
+            "1",
+            StringComparison.Ordinal);
+
     public static bool Compare(in WaitingDcb waiter, ulong value)
     {
         var masked = value & waiter.Mask;
@@ -522,7 +693,7 @@ internal static class GpuWaitRegistry
             0 => true,
             1 => masked < reference,
             2 => masked <= reference,
-            3 => masked == reference,
+            3 => _equalCompareExact ? masked == reference : masked >= reference,
             4 => masked != reference,
             5 => masked >= reference,
             6 => masked > reference,
