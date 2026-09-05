@@ -3466,12 +3466,12 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Dictionary<long, GuestImageResource> _guestImageVersions = new();
         private readonly HashSet<long> _capturedGuestFlipVersions = [];
 
-        // Flip snapshots are created and retired once per presented frame, at the size and format
-        // of the guest's scanout surface, and those never change from one frame to the next -- so
-        // the image and its memory are recycled rather than reallocated.  Measured on an Adreno
-        // 830 at 3840x2160: vkAllocateMemory 7.1 ms and vkFreeMemory 3.9 ms per frame, 11.0 ms of
-        // a 17.8 ms frame, against 3.6 ms for every other Vulkan command in that frame put
-        // together.
+        // Flip snapshots are created and retired once per guest flip, at the size and format of
+        // the guest's scanout surface, and those never change from one flip to the next — so the
+        // image and its memory are recycled rather than reallocated.  At 3840x2160 that costs
+        // vkAllocateMemory 1.9 ms and vkFreeMemory 0.7 ms on a Radeon RX 6950 XT, and 7.1 ms and
+        // 3.9 ms on an Adreno 830, where it is 11.0 ms of a 17.8 ms frame against 3.6 ms for every
+        // other Vulkan command in that frame put together.
         //
         // Recycling one is safe without tracking its layout, because the flip capture barriers it
         // from ImageLayout.Undefined and then overwrites every texel with a full-extent
@@ -3482,7 +3482,7 @@ internal static unsafe class VulkanVideoPresenter
             _guestFlipSnapshotPool = new();
         // Retirement lags presentation by at most the frames in flight, so this only has to cover
         // that plus the one being built.  A guest that changes scanout size leaves the old entries
-        // behind; they are freed by the sweep in RecycleGuestFlipSnapshot.
+        // behind; they are freed by the sweep in TryRecycleGuestFlipSnapshot.
         private const int MaxPooledGuestFlipSnapshots = MaxFramesInFlight + 1;
         // Set by DisposeVulkan so that teardown destroys rather than recycles.
         private bool _guestFlipSnapshotPoolClosed;
@@ -15088,16 +15088,19 @@ internal static unsafe class VulkanVideoPresenter
 
         /// <summary>
         /// Returns a retired flip snapshot's image and memory to the pool instead of freeing them,
-        /// and reports whether it took ownership.  Everything derived from the image -- views,
-        /// framebuffers and render passes -- is still destroyed by the caller, so a recycled
+        /// and reports whether it took ownership.  Everything derived from the image — views,
+        /// framebuffers and render passes — is still destroyed by the caller, so a recycled
         /// snapshot carries nothing forward but its allocation.
         /// </summary>
         /// <remarks>
-        /// Called from <see cref="DestroyGuestImage"/> rather than from the retire sites, of which
-        /// there are six, so that a path added later cannot quietly opt out of it.  Every one of
-        /// those sites already waits for the submission that used the snapshot to complete before
-        /// retiring it -- the same guarantee that makes the image safe to destroy is what makes it
-        /// safe to hand straight back out.
+        /// Called from <see cref="DestroyGuestImage"/> rather than from each site that retires a
+        /// snapshot, so that a path added later cannot quietly opt out of it.  Two invariants make
+        /// that safe.  Nothing but a flip snapshot can reach the pool: FlipVersion is assigned
+        /// where one is created and nowhere else, so an image arriving by any other path fails the
+        /// guard below.  And every path that retires one has already waited for the GPU work that
+        /// used it, either because the snapshot was never submitted — Initialized is set
+        /// immediately after the submit — or because a fence was waited on, which is the same
+        /// guarantee that makes the image safe to destroy at all.
         /// </remarks>
         private bool TryRecycleGuestFlipSnapshot(GuestImageResource resource)
         {
@@ -15212,7 +15215,7 @@ internal static unsafe class VulkanVideoPresenter
             resource.InitialRenderPass = default;
 
             // Everything above is derived from the image and has been destroyed; what is left is
-            // the allocation itself.  A retired flip snapshot keeps it -- see
+            // the allocation itself.  A retired flip snapshot keeps it — see
             // TryRecycleGuestFlipSnapshot for why that is safe and what it is worth.
             if (TryRecycleGuestFlipSnapshot(resource))
             {
