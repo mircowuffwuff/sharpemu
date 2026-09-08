@@ -220,8 +220,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private nint _guestReturnStub;
 
 	private nint _workerAbortStub;
-	private nint _vehManagedEntryLock;
-
 	private uint _workerDoneEventTlsIndex = uint.MaxValue;
 
 	private uint _tbbAbortEligibleTlsIndex = uint.MaxValue;
@@ -723,6 +721,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private readonly Dictionary<ulong, ExternalGuestThreadState> _externalGuestThreads = new Dictionary<ulong, ExternalGuestThreadState>();
 
+	private int _mainHostThreadId;
+
+	public static string? CurrentTitleId { get; set; }
+
 	[ThreadStatic]
 	private static ulong _currentExternalGuestThreadHandle;
 
@@ -883,7 +885,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ulong Rax,
 		ulong Rbx,
 		ulong Rcx,
-		ulong Rdx);
+		ulong Rdx,
+		ulong Rsi = 0,
+		ulong Rdi = 0,
+		ulong R8 = 0,
+		ulong R9 = 0,
+		ulong R10 = 0,
+		ulong R11 = 0,
+		ulong R12 = 0,
+		ulong R13 = 0,
+		ulong R14 = 0,
+		ulong R15 = 0);
 
 	public string BackendName => "native-backend";
 
@@ -1106,14 +1118,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			throw new OutOfMemoryException("Failed to allocate host stack slot storage");
 		}
-		_vehManagedEntryLock = (nint)VirtualAlloc(null, 64u, 12288u, 4u);
-		if (_vehManagedEntryLock == 0)
-		{
-			throw new OutOfMemoryException("Failed to allocate VEH managed-entry lock");
-		}
-		// owner (nint) + depth (int); recursive — nested VEH on same thread must reenter.
-		*(nint*)_vehManagedEntryLock = 0;
-		*(int*)(_vehManagedEntryLock + sizeof(nint)) = 0;
 		_unresolvedReturnStub = CreateUnresolvedReturnStub();
 		_guestReturnStub = CreateGuestReturnStub();
 		if (_guestReturnStub == 0)
@@ -2587,14 +2591,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return (nint)ptr;
 	}
 
-	private unsafe nint CreateExceptionHandlerTrampoline(nint managedHandler)
+	internal unsafe nint CreateExceptionHandlerTrampoline(nint managedHandler)
 	{
 		// Live VEH trampoline used by SetupExceptionHandler. Must pre-filter
 		// FastFail / CLR / MSVC C++ / stack-overflow the same way as
 		// WindowsFaultHandling.CreateHandlerThunk: entering managed VEH while
 		// the thread is in cooperative GC mode fail-fasts with
 		// "UnmanagedCallersOnly method from managed code" (tLT18–22).
-		// Extra headroom for native tbb abort + recursive managed-entry spinlock.
+		// Extra headroom for native worker abort and FastFail diagnostics.
 		const uint stubSize = 2048u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
 		if (ptr == null)
@@ -2888,9 +2892,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			EmitByte(code, ref offset, 0xB8); EmitUInt32(code, ref offset, unchecked((uint)-1));
 			EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89);
 			EmitByte(code, ref offset, 0xE4); // mov rsp, r12
-			EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
-			EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C);
-			EmitByte(code, ref offset, 0xC3);
+			EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D); // pop r13
+			EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C); // pop r12
+			EmitByte(code, ref offset, 0xC3);    // ret
 
 			int tbbFallthroughOffset = offset;
 			*(int*)(code + tbbFallthroughJump) = tbbFallthroughOffset - (tbbFallthroughJump + sizeof(int));
@@ -2918,82 +2922,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		int belowStackJump = offset;
 		EmitUInt32(code, ref offset, 0u);
 
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
-		// Serialize managed VEH entry (recursive spinlock). Concurrent UnmanagedCallersOnly
-		// FailFast was the tLTQ silent mid-TBB pattern (enter without abort breadcrumb).
-		// Lock layout: [0]=owner UniqueThread (nint), [8]=depth (int).
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xB9);
-		*(nint*)(code + offset) = _vehManagedEntryLock;
-		offset += sizeof(nint); // mov r9, lock*
-		EmitByte(code, ref offset, 0x65); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x14);
-		EmitByte(code, ref offset, 0x25); EmitUInt32(code, ref offset, 0x48u); // mov r10, gs:[0x48]
-		int hostAcquireSpin = offset;
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [r9]
-		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xD0); // cmp rax, r10
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x84);
-		int hostMineJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x85); EmitByte(code, ref offset, 0xC0); // test rax, rax
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int hostPauseJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int hostRetryJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xC7);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08);
-		EmitUInt32(code, ref offset, 1u); // mov dword [r9+8], 1
-		EmitByte(code, ref offset, 0xE9);
-		int hostGotJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		int hostPauseOffset = offset;
-		EmitByte(code, ref offset, 0xF3); EmitByte(code, ref offset, 0x90); // pause
-		EmitByte(code, ref offset, 0xE9);
-		int hostPauseBackJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		int hostMineOffset = offset;
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xFF);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08); // inc dword [r9+8]
-		int hostGotOffset = offset;
-		*(int*)(code + hostMineJump) = hostMineOffset - (hostMineJump + sizeof(int));
-		*(int*)(code + hostPauseJump) = hostPauseOffset - (hostPauseJump + sizeof(int));
-		*(int*)(code + hostRetryJump) = hostAcquireSpin - (hostRetryJump + sizeof(int));
-		*(int*)(code + hostGotJump) = hostGotOffset - (hostGotJump + sizeof(int));
-		*(int*)(code + hostPauseBackJump) = hostAcquireSpin - (hostPauseBackJump + sizeof(int));
+		// Allocate Win64 shadow space (0x28) aligned to 16 bytes before calling into managed code or Win32 APIs.
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83);
+		EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28); // sub rsp, 0x28
+		// Never hold a process-wide native lock across reverse P/Invoke: the
+		// handler may wait for GC or a resource owned by another faulting thread.
+		// Keep native exception filtering and per-thread recursion protection.
 		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE9); // mov rcx, r13
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
 		*(nint*)(code + offset) = managedHandler;
 		offset += sizeof(nint);
 		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xB9);
-		*(nint*)(code + offset) = _vehManagedEntryLock;
-		offset += sizeof(nint); // mov r9, lock*
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xFF);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x08); // dec dword [r9+8]
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int hostStillJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xC7);
-		EmitByte(code, ref offset, 0x01); EmitUInt32(code, ref offset, 0u); // mov qword [r9], 0
-		int hostStillOffset = offset;
-		*(int*)(code + hostStillJump) = hostStillOffset - (hostStillJump + sizeof(int));
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov rsp, r12
 		EmitByte(code, ref offset, 0xE9);
 		int hostRestoreJump = offset;
 		EmitUInt32(code, ref offset, 0u);
 
 		int guestStackOffset = offset;
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83);
+		EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28); // sub rsp, 0x28
 		EmitByte(code, ref offset, 0xB9);
 		EmitUInt32(code, ref offset, _hostRspSlotTlsIndex);
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
 		*(nint*)(code + offset) = _tlsGetValueAddress;
 		offset += sizeof(nint);
 		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov rsp, r12
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x85); EmitByte(code, ref offset, 0xC0); // test rax, rax
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x84);
 		int missingTlsJump = offset;
@@ -3005,64 +2959,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitUInt32(code, ref offset, 0u);
 		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xDC); // mov rsp, r11
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xB9);
-		*(nint*)(code + offset) = _vehManagedEntryLock;
-		offset += sizeof(nint); // mov r9, lock*
-		EmitByte(code, ref offset, 0x65); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x14);
-		EmitByte(code, ref offset, 0x25); EmitUInt32(code, ref offset, 0x48u); // mov r10, gs:[0x48]
-		int guestAcquireSpin = offset;
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [r9]
-		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xD0); // cmp rax, r10
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x84);
-		int guestMineJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x85); EmitByte(code, ref offset, 0xC0);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int guestPauseJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int guestRetryJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xC7);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08);
-		EmitUInt32(code, ref offset, 1u);
-		EmitByte(code, ref offset, 0xE9);
-		int guestGotJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		int guestPauseOffset = offset;
-		EmitByte(code, ref offset, 0xF3); EmitByte(code, ref offset, 0x90);
-		EmitByte(code, ref offset, 0xE9);
-		int guestPauseBackJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		int guestMineOffset = offset;
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xFF);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08);
-		int guestGotOffset = offset;
-		*(int*)(code + guestMineJump) = guestMineOffset - (guestMineJump + sizeof(int));
-		*(int*)(code + guestPauseJump) = guestPauseOffset - (guestPauseJump + sizeof(int));
-		*(int*)(code + guestRetryJump) = guestAcquireSpin - (guestRetryJump + sizeof(int));
-		*(int*)(code + guestGotJump) = guestGotOffset - (guestGotJump + sizeof(int));
-		*(int*)(code + guestPauseBackJump) = guestAcquireSpin - (guestPauseBackJump + sizeof(int));
 		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE9); // mov rcx, r13
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
 		*(nint*)(code + offset) = managedHandler;
 		offset += sizeof(nint);
 		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xB9);
-		*(nint*)(code + offset) = _vehManagedEntryLock;
-		offset += sizeof(nint);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0xFF);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x08); // dec dword [r9+8]
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
-		int guestStillJump = offset;
-		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xC7);
-		EmitByte(code, ref offset, 0x01); EmitUInt32(code, ref offset, 0u);
-		int guestStillOffset = offset;
-		*(int*)(code + guestStillJump) = guestStillOffset - (guestStillJump + sizeof(int));
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
 		EmitByte(code, ref offset, 0xE9);
 		int guestRestoreJump = offset;
@@ -3072,9 +2973,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0); // xor eax, eax
 		int restoreOffset = offset;
 		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov rsp, r12
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
-		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C);
-		EmitByte(code, ref offset, 0xC3);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D); // pop r13
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C); // pop r12
+		EmitByte(code, ref offset, 0xC3);    // ret
 
 		*(int*)(code + aboveStackJump) = guestStackOffset - (aboveStackJump + sizeof(int));
 		*(int*)(code + belowStackJump) = guestStackOffset - (belowStackJump + sizeof(int));
@@ -3205,23 +3106,46 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				byte* ptr = (byte*)num5;
 				int scanBytes = (int)(num6 - num5);
-				for (int i = 0; i <= scanBytes - MinTlsPatchInstructionBytes; i++)
+				// These patterns must only be recognized at instruction boundaries.
+				// Scanning byte by byte can match inside another instruction -- an
+				// embedded immediate, say -- and the patch then overwrites that
+				// instruction with its call/NOP sequence, corrupting guest code.
+				var reader = new CpuPatcher.UnsafeCodeReader(ptr, scanBytes);
+				var decoder = Decoder.Create(64, reader, DecoderOptions.None);
+				decoder.IP = num5;
+				while (reader.Position < scanBytes)
 				{
-					nint address = (nint)(ptr + i);
-					int remainingBytes = scanBytes - i;
-					if (TryPatchTlsLoadInstruction(address, ptr + i, remainingBytes, i))
+					int instructionOffset = reader.Position;
+					decoder.Decode(out var instruction);
+					if (instruction.Code == Code.INVALID ||
+						instruction.Length <= 0 ||
+						instructionOffset + instruction.Length > scanBytes)
+					{
+						// Data or padding inside an executable range: step over it
+						// rather than abandoning the rest of the region.
+						if (reader.Position <= instructionOffset)
+						{
+							reader.Skip(1);
+						}
+
+						continue;
+					}
+
+					nint address = (nint)(ptr + instructionOffset);
+					int remainingBytes = scanBytes - instructionOffset;
+					if (TryPatchTlsLoadInstruction(address, ptr + instructionOffset, remainingBytes, instructionOffset))
 					{
 						num3++;
 					}
-					else if (remainingBytes >= 12 && TryPatchTlsImmediateStoreInstruction(address, ptr + i))
+					else if (remainingBytes >= 12 && TryPatchTlsImmediateStoreInstruction(address, ptr + instructionOffset))
 					{
 						num9++;
 					}
-					else if (remainingBytes >= 12 && TryPatchSse4aExtrqBlend(address, ptr + i))
+					else if (remainingBytes >= 12 && TryPatchSse4aExtrqBlend(address, ptr + instructionOffset))
 					{
 						sse4aPatchCount++;
 					}
-					else if (TryPatchStackCanaryInstruction(address, ptr + i))
+					else if (TryPatchStackCanaryInstruction(address, ptr + instructionOffset))
 					{
 						num4++;
 					}
@@ -6262,6 +6186,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		nint previousHostRspSlotValue = TlsGetValue(_hostRspSlotTlsIndex);
 		try
 		{
+			_mainHostThreadId = unchecked((int)GetCurrentThreadId());
 			_activeExecutionBackend = this;
 			_activeCpuContext = context;
 			_activeEntryReturnSentinelRip = 0;
@@ -6459,6 +6384,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
+			_mainHostThreadId = 0;
 			StopReadyThreadDispatcher();
 			StopStallWatchdog();
 			ActiveEntryReturnSentinelRip = 0uL;
@@ -6874,6 +6800,61 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
 			}
 
+			var mainHostThreadId = Volatile.Read(ref _mainHostThreadId);
+			if (mainHostThreadId != 0 && TryCaptureHostThreadContext(mainHostThreadId, out var mainCtx))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Live hardware context (main thread {mainHostThreadId}):");
+				Console.Error.WriteLine($"[LOADER][ERROR]   RIP=0x{mainCtx.Rip:X16} RSP=0x{mainCtx.Rsp:X16} RBP=0x{mainCtx.Rbp:X16}");
+				Console.Error.WriteLine($"[LOADER][ERROR]   RAX=0x{mainCtx.Rax:X16} RBX=0x{mainCtx.Rbx:X16} RCX=0x{mainCtx.Rcx:X16} RDX=0x{mainCtx.Rdx:X16}");
+				Console.Error.WriteLine($"[LOADER][ERROR]   RSI=0x{mainCtx.Rsi:X16} RDI=0x{mainCtx.Rdi:X16} R8=0x{mainCtx.R8:X16} R9=0x{mainCtx.R9:X16}");
+				Console.Error.WriteLine($"[LOADER][ERROR]   R10=0x{mainCtx.R10:X16} R11=0x{mainCtx.R11:X16} R12=0x{mainCtx.R12:X16} R13=0x{mainCtx.R13:X16} R14=0x{mainCtx.R14:X16} R15=0x{mainCtx.R15:X16}");
+
+				string ripModule = ResolveHostAddress(mainCtx.Rip);
+				Console.Error.WriteLine($"[LOADER][ERROR]   RIP location: {ripModule}");
+
+				if (VirtualQuery((void*)(mainCtx.Rip - 32), out var mbiPre, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+					mbiPre.State == 0x1000 && (mbiPre.Protect & 0xEE) != 0)
+				{
+					Span<byte> preBytes = stackalloc byte[48];
+					fixed (byte* dst = preBytes)
+					{
+						Buffer.MemoryCopy((void*)(mainCtx.Rip - 32), dst, 48, 48);
+					}
+					Console.Error.WriteLine($"[LOADER][ERROR]   Live bytes @[RIP-32..RIP+16]: {BitConverter.ToString(preBytes.ToArray()).Replace("-", " ")}");
+				}
+
+				Span<byte> liveBytes = stackalloc byte[16];
+				if (VirtualQuery((void*)mainCtx.Rip, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+					mbi.State == 0x1000 && (mbi.Protect & 0xEE) != 0)
+				{
+					fixed (byte* dst = liveBytes)
+					{
+						Buffer.MemoryCopy((void*)mainCtx.Rip, dst, 16, 16);
+					}
+					Console.Error.WriteLine($"[LOADER][ERROR]   Live bytes @RIP: {BitConverter.ToString(liveBytes.ToArray()).Replace("-", " ")}");
+				}
+
+				if (VirtualQuery((void*)mainCtx.Rsp, out var sMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+					sMbi.State == 0x1000 && (sMbi.Protect & 0xEE) != 0)
+				{
+					Console.Error.WriteLine("[LOADER][ERROR]   Live stack frames (host code pointers):");
+					for (int offset = 0; offset < 256; offset += 8)
+					{
+						var val = *(ulong*)(mainCtx.Rsp + (ulong)offset);
+						if (val != 0)
+						{
+							var resolved = ResolveHostAddress(val);
+							if (!resolved.StartsWith("0x", StringComparison.Ordinal) ||
+								(VirtualQuery((void*)val, out var ptrMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+								 ptrMbi.State == 0x1000 && (ptrMbi.Protect & 0xEE) != 0))
+							{
+								Console.Error.WriteLine($"[LOADER][ERROR]     [rsp+0x{offset:X2}] = 0x{val:X16} ({resolved})");
+							}
+						}
+					}
+				}
+			}
+
 			var threads = SnapshotGuestThreads();
 			if (threads.Length != 0)
 			{
@@ -6953,7 +6934,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				ReadCtxU64(contextRecord, 120),
 				ReadCtxU64(contextRecord, 144),
 				ReadCtxU64(contextRecord, 128),
-				ReadCtxU64(contextRecord, 136));
+				ReadCtxU64(contextRecord, 136),
+				ReadCtxU64(contextRecord, 168),
+				ReadCtxU64(contextRecord, 176),
+				ReadCtxU64(contextRecord, 184),
+				ReadCtxU64(contextRecord, 192),
+				ReadCtxU64(contextRecord, 200),
+				ReadCtxU64(contextRecord, 208),
+				ReadCtxU64(contextRecord, 216),
+				ReadCtxU64(contextRecord, 224),
+				ReadCtxU64(contextRecord, 232),
+				ReadCtxU64(contextRecord, 240));
 			return true;
 		}
 		finally
@@ -6968,6 +6959,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			_ = CloseHandle(threadHandle);
 		}
+	}
+
+	private static string ResolveHostAddress(ulong addr)
+	{
+		try
+		{
+			foreach (ProcessModule mod in Process.GetCurrentProcess().Modules)
+			{
+				var b = (ulong)mod.BaseAddress;
+				if (addr >= b && addr < b + (ulong)mod.ModuleMemorySize)
+				{
+					return $"{mod.ModuleName}+0x{addr - b:X}";
+				}
+			}
+		}
+		catch { }
+		return $"0x{addr:X16}";
 	}
 
 
@@ -7209,11 +7217,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			VirtualFree((void*)_hostRspSlotStorage, 0u, 32768u);
 			_hostRspSlotStorage = 0;
-		}
-		if (_vehManagedEntryLock != 0)
-		{
-			VirtualFree((void*)_vehManagedEntryLock, 0u, 32768u);
-			_vehManagedEntryLock = 0;
 		}
 		if (_workerAbortStack != 0)
 		{
