@@ -1,0 +1,19 @@
+{
+    "emulator": "sharpemu",
+    "name": "Flip snapshot pool",
+    "notes": "android plus a pool for the per-frame guest flip snapshot. a topic branch, open upstream -- import it to try the change before it lands.",
+    "hostSeams": ["window", "audio", "pad-1"],
+    "env": {},
+    "bootCheckpoints": [
+        { "pattern": "SharpEmu starting", "description": "Starting SharpEmu…" },
+        { "pattern": "Creating runtime", "description": "Preparing the runtime…" },
+        { "pattern": "Kernel TSC frequency", "description": "Calibrating the clock…" },
+        { "pattern": "host address space:", "description": "Reserving memory for the game…" },
+        { "pattern": "type initializers", "description": "Warming up the emulator…" },
+        { "pattern": "[LOADER] Title:", "description": "Reading the game…", "gameStarts": true },
+        { "pattern": "module(s)...", "description": "Loading modules…" },
+        { "pattern": "=== Execute START ===", "description": "Starting the game…" },
+        { "pattern": "Scheduled guest thread", "description": "Starting the game…" },
+        { "pattern": "Vulkan VideoOut ready", "description": "Preparing the display…" }
+    ]
+}
