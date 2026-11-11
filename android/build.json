@@ -3,6 +3,7 @@
     "name": "Android platform support",
     "notes": "SharpEmu expanded by Android platform support.",
     "hostSeams": ["window", "audio", "pad-1"],
+    "gameArchives": ["zar"],
     "env": {},
     "bootCheckpoints": [
         { "pattern": "SharpEmu starting", "description": "Starting SharpEmu…" },
