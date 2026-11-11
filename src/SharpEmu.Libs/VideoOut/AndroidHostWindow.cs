@@ -66,6 +66,9 @@ internal sealed unsafe class AndroidHostWindow : IHostWindow
     public AndroidHostWindow(string title, HostVideoOptions options)
     {
         _options = ApplyHostSize(options).Normalize();
+        // The overlay takes its visibility, mode and corner from the options, as SdlHostWindow
+        // configures it, and draws nothing until it has been configured.
+        PerfOverlay.Configure(_options);
         // registered before anything renders, because a guest that reaches its pad initialisation
         // before its first frame — which several do — would otherwise find no source and cache the
         // absence.
@@ -227,6 +230,7 @@ internal sealed unsafe class AndroidHostWindow : IHostWindow
         }
 
         _disposed = true;
+        PerfOverlay.Shutdown();
         if (_input is not null)
         {
             // Clear compares before it clears, so a source registered after this one is left alone.
