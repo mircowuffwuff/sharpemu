@@ -549,7 +549,7 @@ public sealed class GuestSpaceOwner : IDisposable
             return;
         }
 
-        foreach (var range in _host.ReserveFreeAddressRanges(UserAddressStart, UserAddressEnd, MinimumPreReservedRange))
+        foreach (var range in _host.ReserveFreeAddressRanges(UserAddressStart, HostAddressSpace.LimitGuestPreReservation(UserAddressEnd), MinimumPreReservedRange))
         {
             _owned.Add(range.Address, range.Size);
             AddFreeRange(range.Address, range.Size);

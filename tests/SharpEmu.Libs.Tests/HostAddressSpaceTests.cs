@@ -83,6 +83,37 @@ public sealed class HostAddressSpaceTests
     }
 
     [Fact]
+    public void TheGuestPreReservationPassesThroughOnTheClassicLayout()
+    {
+        var windows = HostAddressSpace.Compute(HostAddressSpace.ClassicWindowsLimit, windows: true);
+        var posix = HostAddressSpace.Compute(HostAddressSpace.ClassicPosixLimit, windows: false);
+
+        Assert.Equal(0x00FC_0000_0000UL, windows.LimitGuestPreReservation(0x00FC_0000_0000UL));
+        Assert.Equal(0x00FC_0000_0000UL, posix.LimitGuestPreReservation(0x00FC_0000_0000UL));
+    }
+
+    [Fact]
+    public void TheGuestPreReservationStopsBelowTheCompactFamily()
+    {
+        var layout = HostAddressSpace.Compute(NarrowLimit, windows: false);
+        var end = layout.LimitGuestPreReservation(0x00FC_0000_0000UL);
+
+        Assert.Equal(layout.FamilyTop - HostAddressSpace.ReservationSize, end);
+        Assert.True(end <= layout.GuestAllocationArenaAddress);
+        Assert.True(end <= layout.LowestProbedAddress - 0x0002_0000UL);
+    }
+
+    [Fact]
+    public void TheGuestPreReservationNeverGrowsPastTheEndItIsGiven()
+    {
+        // A compact layout on a 42-bit host puts the family well above 1008 GiB.
+        var layout = HostAddressSpace.Compute(0x0000_03FF_FFFF_F000UL, windows: false);
+
+        Assert.True(layout.IsCompact);
+        Assert.Equal(0x00FC_0000_0000UL, layout.LimitGuestPreReservation(0x00FC_0000_0000UL));
+    }
+
+    [Fact]
     public void TheCompactLayoutDoesNotMoveWithAslr()
     {
         // The detected ceiling is the top of the process stack, which the kernel

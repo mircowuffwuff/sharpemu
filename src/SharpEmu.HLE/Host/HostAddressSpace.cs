@@ -149,6 +149,19 @@ public static class HostAddressSpace
     /// <summary>Base of the small guest allocation arena (PhysicalVirtualMemory).</summary>
     public static ulong GuestAllocationArenaAddress => Current.GuestAllocationArenaAddress;
 
+    /// <summary>
+    /// Caps the end of the range the guest memory owner pre-reserves at startup
+    /// (GuestSpaceOwner) so that the reservation never takes the family's own
+    /// addresses.
+    /// </summary>
+    /// <remarks>
+    /// The classic family sits far above that range and the end passes through
+    /// unchanged. The compact family sits inside it, so the reservation stops
+    /// where the family's allowance starts. Later reservations are not bounded
+    /// by this.
+    /// </remarks>
+    public static ulong LimitGuestPreReservation(ulong end) => Current.LimitGuestPreReservation(end);
+
     /// <summary>One line naming the chosen layout, for diagnostics.</summary>
     public static string Describe() =>
         $"host address space: limit=0x{UserAddressSpaceLimit:X} " +
@@ -182,6 +195,9 @@ public static class HostAddressSpace
         public ulong ReturnToHostStubBaseAddress => FamilyTop - ReturnToHostStubOffset;
 
         public ulong GuestThreadStackBaseAddress => FamilyTop - GuestThreadStackOffset;
+
+        public ulong LimitGuestPreReservation(ulong end) =>
+            IsCompact ? Math.Min(end, FamilyTop - ReservationSize) : end;
 
         /// <summary>
         /// Lowest address any member of the family can probe down to: the
