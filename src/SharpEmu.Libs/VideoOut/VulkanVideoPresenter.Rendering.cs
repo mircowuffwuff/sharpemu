@@ -1359,22 +1359,37 @@ internal static unsafe partial class VulkanVideoPresenter
             BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant);
         }
 
-        private void BindNativeRectangleList(RenderPipelineEntry entry, CommandBuffer command)
+        private bool TryBindNativeRectangleList(RenderPipelineEntry entry, CommandBuffer command)
         {
             Pipeline variant;
             lock (entry)
             {
                 if (entry.RectangleVariant.Handle == 0)
                 {
-                    entry.RectangleVariant = _presenter.CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
-                        entry.Layout, _presenter._supportsFillRectangle ? PolygonMode.FillRectangleNV : PolygonMode.Fill,
-                        expandRectangles: !_presenter._supportsFillRectangle);
+                    if (!CanDrawNativeRectangles)
+                    {
+                        return false;
+                    }
+
+                    try
+                    {
+                        entry.RectangleVariant = _presenter.CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
+                            entry.Layout, _presenter._supportsFillRectangle ? PolygonMode.FillRectangleNV : PolygonMode.Fill,
+                            expandRectangles: !_presenter._supportsFillRectangle);
+                    }
+                    catch (InvalidOperationException exception) when (
+                        !_presenter._supportsFillRectangle && _presenter.IsGeometryPipelineRefusal(exception))
+                    {
+                        _presenter.StopExpandingRectanglesWithGeometry(exception);
+                        return false;
+                    }
                 }
 
                 variant = entry.RectangleVariant;
             }
 
             BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant);
+            return true;
         }
 
         // Rectangle assembly consumes groups of three and discards incomplete trailing groups.
@@ -1387,11 +1402,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var count = vertexCount;
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                if (CanDrawNativeRectangles)
-                {
-                    BindNativeRectangleList(entry, command);
-                }
-                else
+                if (!TryBindNativeRectangleList(entry, command))
                 {
                     var strip = IsSingleRectangle(vertexCount);
                     BindRectangleListVariant(entry, strip, command);
@@ -1425,11 +1436,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                if (CanDrawNativeRectangles)
-                {
-                    BindNativeRectangleList(entry, command);
-                }
-                else
+                if (!TryBindNativeRectangleList(entry, command))
                 {
                     BindRectangleListVariant(entry, strip: false, command);
                 }
@@ -1452,11 +1459,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                if (CanDrawNativeRectangles)
-                {
-                    BindNativeRectangleList(entry, command);
-                }
-                else
+                if (!TryBindNativeRectangleList(entry, command))
                 {
                     BindRectangleListVariant(entry, strip: false, command);
                 }
@@ -1479,11 +1482,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                if (CanDrawNativeRectangles)
-                {
-                    BindNativeRectangleList(entry, command);
-                }
-                else
+                if (!TryBindNativeRectangleList(entry, command))
                 {
                     BindRectangleListVariant(entry, strip: false, command);
                 }
